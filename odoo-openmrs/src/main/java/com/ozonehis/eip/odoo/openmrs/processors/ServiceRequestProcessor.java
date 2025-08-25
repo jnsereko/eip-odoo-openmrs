@@ -88,11 +88,31 @@ public class ServiceRequestProcessor implements Processor {
                 }
                 String encounterVisitUuid = encounter.getPartOf().getReference().split("/")[1];
                 Partner partner = partnerHandler.createOrUpdatePartner(producerTemplate, patient);
-                if ("c".equals(eventType) || "u".equals(eventType)) {
-                    if (serviceRequest.getStatus().equals(ServiceRequest.ServiceRequestStatus.ACTIVE)
-                            && serviceRequest.getIntent().equals(ServiceRequest.ServiceRequestIntent.ORDER)) {
+
+                log.warn("ServiceRequestProcessor: Processing event type: {}", eventType);
+                log.warn(
+                        "ServiceRequestProcessor: ServiceRequest ID: {}, Status: {}, Intent: {}",
+                        serviceRequest.getIdPart(),
+                        serviceRequest.getStatus(),
+                        serviceRequest.getIntent());
+                log.warn("ServiceRequestProcessor: Encounter Visit UUID: {}", encounterVisitUuid);
+
+                // Determine the actual action based on event type and service request status
+                String actualAction = determineActualAction(eventType, serviceRequest);
+                log.warn("ServiceRequestProcessor: Determined action: {}", actualAction);
+
+                if ("CREATE".equals(actualAction) || "UPDATE".equals(actualAction)) {
+                    boolean isOrderIntent =
+                            serviceRequest.getIntent().equals(ServiceRequest.ServiceRequestIntent.ORDER);
+                    boolean isActiveStatus =
+                            serviceRequest.getStatus().equals(ServiceRequest.ServiceRequestStatus.ACTIVE);
+                    boolean isCompletedStatus =
+                            serviceRequest.getStatus().equals(ServiceRequest.ServiceRequestStatus.COMPLETED);
+
+                    if (isOrderIntent && (isActiveStatus || isCompletedStatus)) {
                         SaleOrder saleOrder = saleOrderHandler.getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid);
                         if (saleOrder != null) {
+                            log.warn("ServiceRequestProcessor: Updating existing sale order");
                             saleOrderHandler.updateSaleOrderIfExistsWithSaleOrderLine(
                                     serviceRequest,
                                     saleOrder,
@@ -101,6 +121,7 @@ public class ServiceRequestProcessor implements Processor {
                                     patient.getIdPart(),
                                     producerTemplate);
                         } else {
+                            log.warn("ServiceRequestProcessor: Creating new sale order");
                             saleOrderHandler.createSaleOrderWithSaleOrderLine(
                                     serviceRequest,
                                     encounter,
@@ -110,20 +131,54 @@ public class ServiceRequestProcessor implements Processor {
                                     producerTemplate);
                         }
                     } else {
-                        // Executed when MODIFY option is selected in OpenMRS
+                        log.warn(
+                                "ServiceRequestProcessor: Deleting sale order line due to non-order intent or inactive status");
                         saleOrderHandler.deleteSaleOrderLine(serviceRequest, encounterVisitUuid, producerTemplate);
                     }
-                } else if ("d".equals(eventType)) {
-                    // Executed when DISCONTINUE option is selected in OpenMRS
+                } else if ("DELETE".equals(actualAction)) {
+                    log.warn("ServiceRequestProcessor: Processing actual discontinuation");
                     saleOrderHandler.deleteSaleOrderLine(serviceRequest, encounterVisitUuid, producerTemplate);
                     saleOrderHandler.cancelSaleOrderWhenNoSaleOrderLine(
                             partner.getPartnerId(), encounterVisitUuid, producerTemplate);
                 } else {
-                    throw new IllegalArgumentException("Unsupported event type: " + eventType);
+                    throw new IllegalArgumentException("Unsupported action determined: " + actualAction);
                 }
             }
         } catch (Exception e) {
             throw new CamelExecutionException("Error processing ServiceRequest", exchange, e);
         }
+    }
+
+    /**
+     * Determines the actual action to take based on event type and service request status.
+     * This helps distinguish between actual discontinuation and result addition.
+     */
+    private String determineActualAction(String eventType, ServiceRequest serviceRequest) {
+        ServiceRequest.ServiceRequestStatus status = serviceRequest.getStatus();
+        ServiceRequest.ServiceRequestIntent intent = serviceRequest.getIntent();
+
+        log.warn("ServiceRequestProcessor - Current status: {}", status);
+
+        if ("c".equals(eventType)) {
+            return "CREATE";
+        } else if ("u".equals(eventType)) {
+            return "UPDATE";
+        } else if ("d".equals(eventType)) {
+            // Check if this is actually a result addition (completed status) rather than discontinuation
+            if (status == ServiceRequest.ServiceRequestStatus.COMPLETED
+                    && intent == ServiceRequest.ServiceRequestIntent.ORDER) {
+                log.warn("ServiceRequestProcessor: Treating 'd' event as UPDATE due to COMPLETED status");
+                return "UPDATE";
+            } else if (status == ServiceRequest.ServiceRequestStatus.ENTEREDINERROR
+                    || status == ServiceRequest.ServiceRequestStatus.REVOKED) {
+                return "DELETE";
+            } else {
+                // For other statuses with 'd' event, log and treat as update to be safe
+                log.warn("ServiceRequestProcessor: 'd' event with status {}, treating as UPDATE", status);
+                return "UPDATE";
+            }
+        }
+
+        return "UNKNOWN";
     }
 }
