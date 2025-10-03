@@ -181,6 +181,10 @@ public class SaleOrderHandler {
 
     public void deleteSaleOrderLine(Resource resource, String encounterVisitUuid, ProducerTemplate producerTemplate) {
         SaleOrder saleOrder = getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid);
+        log.warn(
+                "SaleOrderHandler: deleteSaleOrderLine called for resource: {}, visit: {}",
+                resource.getClass().getSimpleName(),
+                encounterVisitUuid);
         if (saleOrder != null) {
             Product product = productHandler.getProduct(resource);
             if (product != null) {
@@ -198,6 +202,15 @@ public class SaleOrderHandler {
     public void cancelSaleOrderWhenNoSaleOrderLine(
             int partnerId, String encounterVisitUuid, ProducerTemplate producerTemplate) {
         SaleOrder saleOrder = getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid);
+        log.warn(
+                "SaleOrderHandler: cancelSaleOrderWhenNoSaleOrderLine called for partner: {}, visit: {}",
+                partnerId,
+                encounterVisitUuid);
+        log.warn(
+                "SaleOrderHandler: Sale order line count: {}",
+                (saleOrder != null && saleOrder.getOrderLine() != null)
+                        ? saleOrder.getOrderLine().size()
+                        : "null");
         if (saleOrder != null
                 && (saleOrder.getOrderLine() == null || saleOrder.getOrderLine().isEmpty())) {
             log.debug("SaleOrderHandler: Count of sale order line {}", saleOrder.getOrderLine());

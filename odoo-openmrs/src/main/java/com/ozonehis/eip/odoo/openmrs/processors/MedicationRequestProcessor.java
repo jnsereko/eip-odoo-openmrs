@@ -45,6 +45,9 @@ public class MedicationRequestProcessor implements Processor {
             Bundle bundle = exchange.getMessage().getBody(Bundle.class);
             List<Bundle.BundleEntryComponent> entries = bundle.getEntry();
 
+            Object originalBody = exchange.getIn().getBody();
+            log.warn("Original body type: {}", originalBody.getClass());
+
             Patient patient = null;
             Encounter encounter = null;
             MedicationRequest medicationRequest = null;
@@ -52,6 +55,7 @@ public class MedicationRequestProcessor implements Processor {
 
             for (Bundle.BundleEntryComponent entry : entries) {
                 Resource resource = entry.getResource();
+                log.warn("Found resource type: {}", resource.getResourceType());
                 if (resource instanceof Patient) {
                     patient = (Patient) resource;
                 } else if (resource instanceof Encounter) {
