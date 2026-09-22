@@ -63,6 +63,48 @@ public class UnpaidImagingAuditProcessor implements Processor {
      */
     private static final int LOOKBACK_DAYS = 7;
 
+
+    /**
+     * When the order was placed.
+     *
+     * <p>{@code authoredOn} is the obvious field and is EMPTY on these resources -- measured on UAT,
+     * ServiceRequest a25f85c6 carried no authoredOn and no occurrenceDateTime, and the first version
+     * of this processor duly logged "authoredOn=null", leaving an audit line nobody could reconcile
+     * without a second lookup. The date is there, just not in that field: OpenMRS populates
+     * occurrencePeriod, whose start matches the order's creation to the second.
+     *
+     * <p>Falls back through occurrenceDateTime and finally meta.lastUpdated, which for an order that
+     * has not been edited is also its creation time. Returns null only if the resource genuinely
+     * carries no date at all, and the caller then prints "unknown" rather than a wrong date.
+     */
+    private String orderedAt(ServiceRequest sr) {
+        if (sr.getAuthoredOn() != null) {
+            return sr.getAuthoredOn().toInstant().toString();
+        }
+        if (sr.hasOccurrencePeriod() && sr.getOccurrencePeriod().getStart() != null) {
+            return sr.getOccurrencePeriod().getStart().toInstant().toString();
+        }
+        if (sr.hasOccurrenceDateTimeType() && sr.getOccurrenceDateTimeType().getValue() != null) {
+            return sr.getOccurrenceDateTimeType().getValue().toInstant().toString();
+        }
+        if (sr.getMeta() != null && sr.getMeta().getLastUpdated() != null) {
+            return sr.getMeta().getLastUpdated().toInstant().toString();
+        }
+        return "unknown";
+    }
+
+    /**
+     * When the exam was actually carried out -- occurrencePeriod.end, which OpenMRS sets when the
+     * order is completed. This is the figure a finance reconciliation cares about: not when someone
+     * asked for the scan, but when the hospital did the work it was not paid for.
+     */
+    private String performedAt(ServiceRequest sr) {
+        if (sr.hasOccurrencePeriod() && sr.getOccurrencePeriod().getEnd() != null) {
+            return sr.getOccurrencePeriod().getEnd().toInstant().toString();
+        }
+        return "unknown";
+    }
+
     @Override
     public void process(Exchange exchange) {
         String since = ZonedDateTime.now(ZoneOffset.UTC)
@@ -116,9 +158,9 @@ public class UnpaidImagingAuditProcessor implements Processor {
 
             unpaid++;
             log.warn("UNPAID IMAGING PERFORMED - ServiceRequest {} is COMPLETED but its payment Task is {}. "
-                    + "patient={} procedure='{}' authoredOn={}. The exam was carried out and reported without a "
-                    + "confirmed payment in Odoo; it will not be billed unless someone reconciles it by hand. "
-                    + "See issue #322.",
+                    + "patient={} procedure='{}' ordered={} performed={}. The exam was carried out and reported "
+                    + "without a confirmed payment in Odoo; it will not be billed unless someone reconciles it by "
+                    + "hand. See issue #322.",
                     serviceRequestId,
                     task == null ? "ABSENT" : task.getStatus().toCode(),
                     serviceRequest.getSubject() == null
@@ -127,7 +169,8 @@ public class UnpaidImagingAuditProcessor implements Processor {
                     serviceRequest.getCode() != null && serviceRequest.getCode().getText() != null
                             ? serviceRequest.getCode().getText()
                             : "",
-                    serviceRequest.getAuthoredOn());
+                    orderedAt(serviceRequest),
+                    performedAt(serviceRequest));
         }
 
         if (unpaid > 0) {
