@@ -9,6 +9,7 @@ package com.ozonehis.eip.odoo.openmrs.processors;
 
 import ca.uhn.fhir.rest.client.api.IGenericClient;
 import com.ozonehis.eip.odoo.openmrs.Constants;
+import com.ozonehis.eip.odoo.openmrs.RadiologyConcepts;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.EncounterHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.TaskHandler;
@@ -85,25 +86,8 @@ public class RadiologyPaymentTaskProcessor implements Processor {
     @Autowired
     private EncounterHandler encounterHandler;
 
-    // Radiology concept UUIDs - same whitelist used by the Orthanc bridge's
-    // own worklist-creation logic, kept in sync manually across both repos
-    // for now.
-    private static final Set<String> RADIOLOGY_CONCEPT_UUIDS = new HashSet<>(Arrays.asList(
-            "e3dea2c8-62c6-4487-bdaa-1d009642f7ad", // RX01 - Chest X-ray
-            "82e7d36c-078d-40c6-9854-92b376099307", // RX02 - Abdominal X-ray
-            "701257a2-885e-4249-8319-d9597d2970af", // RX03 - Bone X-ray
-            "b25dcc00-800f-48ac-b31a-f1e9cc53d787", // RX04 - Intravenous urography
-            "81e0643c-a871-475e-8bd5-93945da8877d", // RX05 - Salpingo-urethrogram
-            "1a5e3d73-f897-47ed-840b-d4537b7cc586", // RX06 - Barium enema
-            "0a5ba175-fb7e-4d66-aa6a-ba058f3468c1", // RX07 - CT scan
-            "d0b5d4a0-1001-0000-0000-000000000001",
-            "d0b5d4a0-1002-0000-0000-000000000001",
-            "d0b5d4a0-1003-0000-0000-000000000001",
-            "d0b5d4a0-1004-0000-0000-000000000001",
-            "d0b5d4a0-1005-0000-0000-000000000001",
-            "d0b5d4a0-1006-0000-0000-000000000001",
-            "d0b5d4a0-1007-0000-0000-000000000001",
-            "d0b5d4a0-1008-0000-0000-000000000001"));
+    // The radiology concept list now lives in RadiologyConcepts, so this processor and the
+    // unpaid-imaging audit cannot drift apart. See that class for why #304 is still open.
 
     // How far back each poll looks.
     //
@@ -233,8 +217,7 @@ public class RadiologyPaymentTaskProcessor implements Processor {
     }
 
     private boolean isRadiologyOrder(ServiceRequest serviceRequest) {
-        return serviceRequest.getCode().getCoding().stream()
-                .anyMatch(coding -> RADIOLOGY_CONCEPT_UUIDS.contains(coding.getCode()));
+        return RadiologyConcepts.isRadiologyOrder(serviceRequest);
     }
 
     /**
