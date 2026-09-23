@@ -7,112 +7,103 @@
  */
 package com.ozonehis.eip.odoo.openmrs.handlers;
 
+import static com.ozonehis.eip.odoo.openmrs.FakeOdoo.PATIENT;
+import static com.ozonehis.eip.odoo.openmrs.FakeOdoo.VISIT;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.ArgumentMatchers.anyList;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
-import static org.mockito.MockitoAnnotations.openMocks;
+import static org.mockito.Mockito.mock;
 
-import com.ozonehis.eip.odoo.openmrs.Constants;
+import com.ozonehis.eip.odoo.openmrs.FakeOdoo;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.RadiologyPaymentEvidenceHandler;
 import java.time.Instant;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.mockito.InjectMocks;
-import org.mockito.Mock;
 
 class RadiologyPaymentEvidenceHandlerTest {
 
-    private static final String PATIENT = "patient-uuid";
-
-    private static final String VISIT = "visit-uuid";
-
-    private static final String PROCEDURE = "RX01 - Radiographie thoracique";
+    private static final String PROCEDURE = "RX03 - Radiographie du bassin";
 
     private static final Instant ORDERED = Instant.parse("2026-09-10T08:00:00Z");
 
-    @Mock
-    private OdooClient odooClient;
+    private FakeOdoo odoo;
 
-    @InjectMocks
     private RadiologyPaymentEvidenceHandler handler;
-
-    private AutoCloseable mocksCloser;
 
     @BeforeEach
     void setup() {
-        mocksCloser = openMocks(this);
+        OdooClient odooClient = mock(OdooClient.class);
+        odoo = new FakeOdoo(odooClient);
+        handler = new RadiologyPaymentEvidenceHandler();
+        handler.setOdooClient(odooClient);
+        odoo.saleOrder(1, "S03007");
     }
 
-    @AfterEach
-    void close() throws Exception {
-        mocksCloser.close();
-    }
-
-    private static Map<String, Object> line(int id, String orderName, double qtyInvoiced, String createDate) {
-        Map<String, Object> line = new HashMap<>();
-        line.put("id", id);
-        line.put("name", PROCEDURE);
-        line.put("qty_invoiced", qtyInvoiced);
-        line.put("order_id", new Object[] {id * 10, orderName});
-        line.put("create_date", createDate);
-        return line;
-    }
-
-    private static Map<String, Object> invoice(String paymentState, double residual) {
-        Map<String, Object> invoice = new HashMap<>();
-        invoice.put("name", "INV/2026/09/0001");
-        invoice.put("state", "posted");
-        invoice.put("payment_state", paymentState);
-        invoice.put("amount_residual", residual);
-        return invoice;
-    }
-
-    private void givenLines(Object... lines) {
-        when(odooClient.searchAndRead(eq(Constants.SALE_ORDER_LINE_MODEL), anyList(), anyList()))
-                .thenReturn(lines);
-    }
-
-    private void givenInvoices(String orderName, Object... invoices) {
-        when(odooClient.searchAndRead(
-                        eq(Constants.ACCOUNT_MOVE_MODEL),
-                        eq(List.of(Arrays.asList("invoice_origin", "=", orderName))),
-                        anyList()))
-                .thenReturn(invoices);
+    private boolean paid() {
+        return handler.hasPaidLineOnOrAfter(PATIENT, VISIT, PROCEDURE, ORDERED);
     }
 
     @Test
-    void paidLineOnTheVisitIsEvidence() {
-        givenLines(line(6163, "S02986", 1, "2026-09-10 08:00:05"));
-        givenInvoices("S02986", invoice("paid", 0));
+    void finalInvoicePaidIsPaid() {
+        odoo.line(61, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.paidInvoice(9, "INV/2026/09/0009", 61);
 
-        assertTrue(handler.hasPaidLineOnOrAfter(PATIENT, VISIT, PROCEDURE, ORDERED));
+        assertTrue(paid());
+    }
+
+    /** UAT attempt 2, S03007: down payment auto-paid at 0 BIF, the RX03 line on an unpaid final invoice. */
+    @Test
+    void paidDownPaymentWithUnpaidFinalInvoiceIsNotPaid() {
+        odoo.line(61, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.line(62, 1, "Down payment", 1, "2026-09-10 08:10:00");
+        odoo.paidInvoice(8, "INV/2026/09/0008", 62);
+        odoo.unpaidInvoice(9, "INV/2026/09/0009", 1.0, 61, 62);
+
+        assertFalse(paid());
     }
 
     @Test
-    void noPaidLineIsNotEvidence() {
-        givenLines(line(6163, "S02986", 0, "2026-09-10 08:00:05"));
-        givenInvoices("S02986");
+    void radiologyLineOnlyOnTheUnpaidOfTwoInvoicesIsNotPaid() {
+        odoo.line(61, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.line(63, 1, "CONS1 - Consultation", 1, "2026-09-10 08:00:01");
+        odoo.paidInvoice(7, "INV/2026/09/0007", 63);
+        odoo.unpaidInvoice(9, "INV/2026/09/0009", 1.0, 61);
 
-        assertFalse(handler.hasPaidLineOnOrAfter(PATIENT, VISIT, PROCEDURE, ORDERED));
+        assertFalse(paid());
     }
 
     @Test
-    void invoicedButUnpaidIsNotEvidence() {
-        givenLines(line(6163, "S02986", 1, "2026-09-10 08:00:05"));
-        givenInvoices("S02986", invoice("not_paid", 1500));
+    void creditNoteReversingThePaidInvoiceIsNotPaid() {
+        odoo.line(61, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.paidInvoice(9, "INV/2026/09/0009", 61);
+        odoo.move(10, "RINV/2026/09/0001", "out_refund", "posted", "paid", 0.0, 9);
 
-        assertFalse(handler.hasPaidLineOnOrAfter(PATIENT, VISIT, PROCEDURE, ORDERED));
+        assertFalse(paid());
+    }
+
+    @Test
+    void draftCreditNoteDoesNotCancelThePayment() {
+        odoo.line(61, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.paidInvoice(9, "INV/2026/09/0009", 61);
+        odoo.move(10, "RINV/2026/09/0001", "out_refund", "draft", "not_paid", 1.0, 9);
+
+        assertTrue(paid());
+    }
+
+    @Test
+    void inPaymentIsNotYetPaid() {
+        odoo.line(61, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.move(9, "INV/2026/09/0009", "out_invoice", "posted", "in_payment", 0.0, null, 61);
+
+        assertFalse(paid());
+    }
+
+    @Test
+    void noInvoiceIsNotPaid() {
+        odoo.line(61, 1, PROCEDURE, 0, "2026-09-10 08:00:05");
+
+        assertFalse(paid());
     }
 
     /**
@@ -122,35 +113,37 @@ class RadiologyPaymentEvidenceHandlerTest {
      */
     @Test
     void newerDraftLineInTheSameVisitDoesNotHideThePaidOne() {
-        givenLines(
-                line(6163, "S02986", 1, "2026-09-10 08:00:05"),
-                line(6170, "S03001", 0, "2026-09-10 11:30:00"));
-        givenInvoices("S02986", invoice("paid", 0));
+        odoo.saleOrder(2, "S03010");
+        odoo.line(61, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.line(70, 2, PROCEDURE, 0, "2026-09-10 11:30:00");
+        odoo.paidInvoice(9, "INV/2026/09/0009", 61);
 
-        assertTrue(handler.hasPaidLineOnOrAfter(PATIENT, VISIT, PROCEDURE, ORDERED));
-        verify(odooClient, never())
-                .searchAndRead(
-                        eq(Constants.ACCOUNT_MOVE_MODEL),
-                        eq(List.of(Arrays.asList("invoice_origin", "=", "S03001"))),
-                        anyList());
+        assertTrue(paid());
     }
 
     @Test
-    void paidLineRaisedBeforeTheOrderIsNotEvidence() {
-        givenLines(line(6001, "S02900", 1, "2026-09-07 09:00:00"));
-        givenInvoices("S02900", invoice("paid", 0));
+    void anotherPatientsPaidInvoiceIsNotPaid() {
+        odoo.saleOrder(3, "S03020", "other-patient", "other-visit", "sale");
+        odoo.line(80, 3, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.paidInvoice(20, "INV/2026/09/0020", 80);
 
-        assertFalse(handler.hasPaidLineOnOrAfter(PATIENT, VISIT, PROCEDURE, ORDERED));
+        assertFalse(paid());
     }
 
     @Test
-    void paidLineForAnotherProcedureIsNotEvidence() {
-        Map<String, Object> other = line(6163, "S02986", 1, "2026-09-10 08:00:05");
-        other.put("name", "ECHO1 - Echographie abdominale");
-        givenLines(other);
-        givenInvoices("S02986", invoice("paid", 0));
+    void paidLineRaisedBeforeTheOrderIsNotPaid() {
+        odoo.line(61, 1, PROCEDURE, 1, "2026-09-07 09:00:00");
+        odoo.paidInvoice(9, "INV/2026/09/0009", 61);
 
-        assertFalse(handler.hasPaidLineOnOrAfter(PATIENT, VISIT, PROCEDURE, ORDERED));
+        assertFalse(paid());
+    }
+
+    @Test
+    void paidLineForAnotherProcedureIsNotPaid() {
+        odoo.line(61, 1, "ECHO1 - Echographie abdominale", 1, "2026-09-10 08:00:05");
+        odoo.paidInvoice(9, "INV/2026/09/0009", 61);
+
+        assertFalse(paid());
     }
 
     @Test

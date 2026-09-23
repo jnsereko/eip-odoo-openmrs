@@ -13,18 +13,30 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
- * Answers "is there evidence in Odoo that this imaging order was paid for?" — read-only, for the
- * unpaid-imaging audit (#322).
+ * Answers "is there evidence in Odoo that this imaging order was paid for?" — read-only. Used by the
+ * payment processor to decide whether to accept a Task, and by the unpaid-imaging audit (#322) to
+ * re-check accepted ones. Both go through {@link #isLinePaid}, so they cannot disagree about what a
+ * paid line is.
+ *
+ * <p>What "paid" means for a sale order line: at least one invoice that CARRIES THAT LINE (reached
+ * through the line's own {@code invoice_lines}, not through the sale order) is a posted customer
+ * invoice, {@code payment_state=paid}, nothing outstanding, and not reversed by a posted credit note.
+ * Looking up invoices by {@code invoice_origin} instead - any paid invoice on the same sale order -
+ * was the attempt-2 UAT failure: a 0 BIF down payment on S03007 was auto-paid, and it authorised the
+ * RX03 line sitting unpaid on the final invoice. A down payment invoice is linked to the down payment
+ * line only, so it can never count for an imaging line; the final invoice has to be paid.
  *
  * <p>This is deliberately NOT the payment processor's decision rule. RadiologyPaymentTaskProcessor
  * decides on the NEWEST matching sale order line, which is right for deciding whether to accept a
@@ -49,6 +61,12 @@ public class RadiologyPaymentEvidenceHandler {
     /** Same tolerance as the payment processor: the line is written seconds after the order. */
     private static final long CLOCK_SKEW_SECONDS = 60;
 
+    private static final String ACCOUNT_MOVE_LINE_MODEL = "account.move.line";
+
+    /** The sale order line fields {@link #isLinePaid} needs; callers must read at least these. */
+    public static final List<String> LINE_FIELDS =
+            List.of("id", "name", "qty_invoiced", "order_id", "create_date", "invoice_lines");
+
     @Autowired
     private OdooClient odooClient;
 
@@ -72,7 +90,7 @@ public class RadiologyPaymentEvidenceHandler {
                 Arrays.asList(
                         Arrays.asList("order_id.partner_id.ref", "=", patientUuid),
                         Arrays.asList("order_id.client_order_ref", "=", visitUuid)),
-                Arrays.asList("id", "name", "qty_invoiced", "order_id", "create_date"));
+                LINE_FIELDS);
         if (lines == null || lines.length == 0) {
             return false;
         }
@@ -85,8 +103,6 @@ public class RadiologyPaymentEvidenceHandler {
         }
         Instant cutoff = orderedAt == null ? null : orderedAt.minusSeconds(CLOCK_SKEW_SECONDS);
 
-        // One invoice lookup per sale order, however many of its lines match.
-        Map<String, Boolean> paidByOrderName = new HashMap<>();
         for (Object lineObj : lines) {
             Map<?, ?> line = (Map<?, ?>) lineObj;
             if (!String.valueOf(line.get("name")).toLowerCase().contains(matchKey)) {
@@ -98,47 +114,112 @@ public class RadiologyPaymentEvidenceHandler {
                     continue;
                 }
             }
-            Object qtyInvoiced = line.get("qty_invoiced");
-            if (!(qtyInvoiced instanceof Number) || ((Number) qtyInvoiced).doubleValue() <= 0) {
-                continue;
-            }
-            String orderName = orderName(line.get("order_id"));
-            if (orderName == null) {
-                continue;
-            }
-            if (paidByOrderName.computeIfAbsent(orderName, this::hasPaidInvoice)) {
+            if (isLinePaid(line)) {
                 return true;
             }
         }
         return false;
     }
 
-    /** Paid means what the payment processor accepts: payment_state=paid and nothing outstanding. */
-    private boolean hasPaidInvoice(String orderName) {
-        Object[] invoices = odooClient.searchAndRead(
-                Constants.ACCOUNT_MOVE_MODEL,
-                List.of(Arrays.asList("invoice_origin", "=", orderName)),
-                Arrays.asList("name", "state", "payment_state", "amount_residual"));
-        if (invoices == null) {
+    /**
+     * Whether this sale order line is paid: some invoice carrying it is a posted {@code out_invoice},
+     * {@code payment_state=paid}, {@code amount_residual=0}, and no posted credit note reverses it.
+     *
+     * <p>{@code in_payment} is deliberately NOT paid: in Odoo 17 it means a payment is registered but
+     * not yet reconciled with the bank, and it can still bounce. UAT settles straight to {@code paid}
+     * (INV/2026/09/0006 did), so this costs nothing there.
+     *
+     * <p>Any posted credit note against the invoice cancels it, even a partial one - for a single
+     * imaging line a partial refund still means the exam is disputed, and the audit exists to be
+     * conservative.
+     *
+     * @param line a sale.order.line record read with at least {@link #LINE_FIELDS}
+     * @throws RuntimeException when Odoo cannot be read — "unknown", never "unpaid"
+     */
+    public boolean isLinePaid(Map<?, ?> line) {
+        Object qtyInvoiced = line.get("qty_invoiced");
+        if (!(qtyInvoiced instanceof Number) || ((Number) qtyInvoiced).doubleValue() <= 0) {
             return false;
         }
-        for (Object invoiceObj : invoices) {
-            Map<?, ?> invoice = (Map<?, ?>) invoiceObj;
-            Object residual = invoice.get("amount_residual");
-            if ("paid".equals(String.valueOf(invoice.get("payment_state")))
-                    && residual instanceof Number
-                    && ((Number) residual).doubleValue() == 0.0) {
-                return true;
+        List<Integer> invoiceLineIds = ids(line.get("invoice_lines"));
+        if (invoiceLineIds.isEmpty()) {
+            return false;
+        }
+
+        Object[] invoiceLines = odooClient.searchAndRead(
+                ACCOUNT_MOVE_LINE_MODEL,
+                List.of(Arrays.asList("id", "in", invoiceLineIds)),
+                Arrays.asList("id", "move_id"));
+        Set<Integer> moveIds = new LinkedHashSet<>();
+        if (invoiceLines != null) {
+            for (Object invoiceLine : invoiceLines) {
+                Integer moveId = many2oneId(((Map<?, ?>) invoiceLine).get("move_id"));
+                if (moveId != null) {
+                    moveIds.add(moveId);
+                }
             }
         }
-        return false;
+        if (moveIds.isEmpty()) {
+            return false;
+        }
+
+        Object[] moves = odooClient.searchAndRead(
+                Constants.ACCOUNT_MOVE_MODEL,
+                List.of(Arrays.asList("id", "in", new ArrayList<>(moveIds))),
+                Arrays.asList("id", "name", "move_type", "state", "payment_state", "amount_residual"));
+        Set<Integer> paidInvoiceIds = new LinkedHashSet<>();
+        if (moves != null) {
+            for (Object moveObj : moves) {
+                Map<?, ?> move = (Map<?, ?>) moveObj;
+                Object residual = move.get("amount_residual");
+                if ("out_invoice".equals(String.valueOf(move.get("move_type")))
+                        && "posted".equals(String.valueOf(move.get("state")))
+                        && "paid".equals(String.valueOf(move.get("payment_state")))
+                        && residual instanceof Number
+                        && ((Number) residual).doubleValue() == 0.0
+                        && move.get("id") instanceof Number) {
+                    paidInvoiceIds.add(((Number) move.get("id")).intValue());
+                }
+            }
+        }
+        if (paidInvoiceIds.isEmpty()) {
+            return false;
+        }
+
+        // Searched by reversed_entry_id rather than taken from invoice_lines: a credit note made from
+        // the invoice is not guaranteed to be linked back to the sale order line.
+        Object[] creditNotes = odooClient.searchAndRead(
+                Constants.ACCOUNT_MOVE_MODEL,
+                Arrays.asList(
+                        Arrays.asList("reversed_entry_id", "in", new ArrayList<>(paidInvoiceIds)),
+                        Arrays.asList("move_type", "=", "out_refund"),
+                        Arrays.asList("state", "=", "posted")),
+                Arrays.asList("id", "name", "reversed_entry_id"));
+        if (creditNotes != null) {
+            for (Object creditNote : creditNotes) {
+                paidInvoiceIds.remove(many2oneId(((Map<?, ?>) creditNote).get("reversed_entry_id")));
+            }
+        }
+        return !paidInvoiceIds.isEmpty();
     }
 
-    /** Odoo many2one fields read as [id, display_name]. */
-    private String orderName(Object orderIdField) {
-        if (orderIdField instanceof Object[] && ((Object[]) orderIdField).length > 1) {
-            String name = String.valueOf(((Object[]) orderIdField)[1]);
-            return name.isEmpty() ? null : name;
+    /** Odoo x2many fields read as an array of ids. */
+    private static List<Integer> ids(Object x2many) {
+        List<Integer> ids = new ArrayList<>();
+        if (x2many instanceof Object[]) {
+            for (Object id : (Object[]) x2many) {
+                if (id instanceof Number) {
+                    ids.add(((Number) id).intValue());
+                }
+            }
+        }
+        return ids;
+    }
+
+    /** Odoo many2one fields read as [id, display_name], or false when empty. */
+    private static Integer many2oneId(Object many2one) {
+        if (many2one instanceof Object[] && ((Object[]) many2one).length > 0 && ((Object[]) many2one)[0] instanceof Number) {
+            return ((Number) ((Object[]) many2one)[0]).intValue();
         }
         return null;
     }

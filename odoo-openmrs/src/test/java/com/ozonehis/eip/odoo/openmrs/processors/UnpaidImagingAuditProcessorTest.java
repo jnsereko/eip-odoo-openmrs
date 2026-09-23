@@ -24,7 +24,7 @@ import ca.uhn.fhir.rest.gclient.IRead;
 import ca.uhn.fhir.rest.gclient.IReadExecutable;
 import ca.uhn.fhir.rest.gclient.IReadTyped;
 import ca.uhn.fhir.rest.gclient.IUntypedQuery;
-import com.ozonehis.eip.odoo.openmrs.Constants;
+import com.ozonehis.eip.odoo.openmrs.FakeOdoo;
 import com.ozonehis.eip.odoo.openmrs.RadiologyConcepts;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.RadiologyPaymentEvidenceHandler;
@@ -55,11 +55,11 @@ class UnpaidImagingAuditProcessorTest {
 
     private static final String TASK_ID = "1eb3f3cf-0000-0000-0000-000000000001";
 
-    private static final String PATIENT = "patient-uuid";
+    private static final String PATIENT = FakeOdoo.PATIENT;
 
     private static final String ENCOUNTER = "encounter-uuid";
 
-    private static final String VISIT = "visit-uuid";
+    private static final String VISIT = FakeOdoo.VISIT;
 
     private static final String PROCEDURE = "RX01 - Radiographie thoracique";
 
@@ -69,6 +69,8 @@ class UnpaidImagingAuditProcessorTest {
     private IGenericClient fhirClient;
 
     private OdooClient odooClient;
+
+    private FakeOdoo odoo;
 
     private IReadExecutable<ServiceRequest> readServiceRequest;
 
@@ -81,6 +83,8 @@ class UnpaidImagingAuditProcessorTest {
     void setup() {
         fhirClient = mock(IGenericClient.class);
         odooClient = mock(OdooClient.class);
+        odoo = new FakeOdoo(odooClient);
+        odoo.saleOrder(1, "S02986");
 
         IUntypedQuery<IBaseBundle> untyped = mock(IUntypedQuery.class);
         IQuery<IBaseBundle> query = mock(IQuery.class);
@@ -140,37 +144,11 @@ class UnpaidImagingAuditProcessorTest {
         when(taskQuery.execute()).thenReturn(bundle);
     }
 
-    private static Map<String, Object> line(int id, String orderName, double qtyInvoiced, String createDate) {
-        Map<String, Object> line = new HashMap<>();
-        line.put("id", id);
-        line.put("name", PROCEDURE);
-        line.put("qty_invoiced", qtyInvoiced);
-        line.put("order_id", new Object[] {id * 10, orderName});
-        line.put("create_date", createDate);
-        return line;
-    }
-
-    private void givenLines(Object... lines) {
-        when(odooClient.searchAndRead(eq(Constants.SALE_ORDER_LINE_MODEL), anyList(), anyList()))
-                .thenReturn(lines);
-    }
-
-    private void givenPaidInvoice(String orderName) {
-        Map<String, Object> invoice = new HashMap<>();
-        invoice.put("payment_state", "paid");
-        invoice.put("amount_residual", 0.0);
-        when(odooClient.searchAndRead(
-                        eq(Constants.ACCOUNT_MOVE_MODEL),
-                        eq(List.of(Arrays.asList("invoice_origin", "=", orderName))),
-                        anyList()))
-                .thenReturn(new Object[] {invoice});
-    }
-
     @Test
     void acceptedAndPaidIsNotAFinding() {
         givenTasks(task(TASK_ID, Task.TaskStatus.ACCEPTED));
-        givenLines(line(6163, "S02986", 1, "2026-09-10 08:00:04"));
-        givenPaidInvoice("S02986");
+        odoo.line(6163, 1, PROCEDURE, 1, "2026-09-10 08:00:04");
+        odoo.paidInvoice(1, "INV/2026/09/0001", 6163);
 
         assertEquals(0, processor.auditAcceptedTasks());
     }
@@ -178,7 +156,19 @@ class UnpaidImagingAuditProcessorTest {
     @Test
     void acceptedWithNoPaidLineIsAFinding() {
         givenTasks(task(TASK_ID, Task.TaskStatus.ACCEPTED));
-        givenLines(line(6163, "S02986", 0, "2026-09-10 08:00:04"));
+        odoo.line(6163, 1, PROCEDURE, 0, "2026-09-10 08:00:04");
+
+        assertEquals(1, processor.auditAcceptedTasks());
+    }
+
+    /** UAT attempt 2 (Task 5f38de0a, S03007): accepted on a paid down payment, own invoice unpaid. */
+    @Test
+    void acceptedOnAPaidDownPaymentIsAFinding() {
+        givenTasks(task(TASK_ID, Task.TaskStatus.ACCEPTED));
+        odoo.line(6163, 1, PROCEDURE, 1, "2026-09-10 08:00:04");
+        odoo.line(6164, 1, "Down payment", 1, "2026-09-10 08:10:00");
+        odoo.paidInvoice(8, "INV/2026/09/0008", 6164);
+        odoo.unpaidInvoice(9, "INV/2026/09/0009", 1.0, 6163, 6164);
 
         assertEquals(1, processor.auditAcceptedTasks());
     }
@@ -186,10 +176,10 @@ class UnpaidImagingAuditProcessorTest {
     @Test
     void acceptedWithAPaidLineAndANewerDraftLineInTheSameVisitIsNotAFinding() {
         givenTasks(task(TASK_ID, Task.TaskStatus.ACCEPTED));
-        givenLines(
-                line(6163, "S02986", 1, "2026-09-10 08:00:04"),
-                line(6170, "S03001", 0, "2026-09-10 11:30:00"));
-        givenPaidInvoice("S02986");
+        odoo.saleOrder(2, "S03001");
+        odoo.line(6163, 1, PROCEDURE, 1, "2026-09-10 08:00:04");
+        odoo.line(6170, 2, PROCEDURE, 0, "2026-09-10 11:30:00");
+        odoo.paidInvoice(1, "INV/2026/09/0001", 6163);
 
         assertEquals(0, processor.auditAcceptedTasks());
     }
@@ -207,7 +197,7 @@ class UnpaidImagingAuditProcessorTest {
     @Test
     void odooFailureIsNotAFinding() {
         givenTasks(task(TASK_ID, Task.TaskStatus.ACCEPTED));
-        when(odooClient.searchAndRead(eq(Constants.SALE_ORDER_LINE_MODEL), anyList(), anyList()))
+        when(odooClient.searchAndRead(anyString(), anyList(), anyList()))
                 .thenThrow(new RuntimeException("Odoo unreachable"));
 
         assertEquals(0, processor.auditAcceptedTasks());

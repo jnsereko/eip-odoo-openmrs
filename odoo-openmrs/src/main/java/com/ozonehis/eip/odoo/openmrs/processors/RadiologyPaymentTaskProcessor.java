@@ -11,6 +11,7 @@ import ca.uhn.fhir.rest.client.api.IGenericClient;
 import com.ozonehis.eip.odoo.openmrs.Constants;
 import com.ozonehis.eip.odoo.openmrs.RadiologyConcepts;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
+import com.ozonehis.eip.odoo.openmrs.handlers.odoo.RadiologyPaymentEvidenceHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.EncounterHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.TaskHandler;
 import java.util.Arrays;
@@ -85,6 +86,9 @@ public class RadiologyPaymentTaskProcessor implements Processor {
 
     @Autowired
     private EncounterHandler encounterHandler;
+
+    @Autowired
+    private RadiologyPaymentEvidenceHandler paymentEvidenceHandler;
 
     // The radiology concept list now lives in RadiologyConcepts, so this processor and the
     // unpaid-imaging audit cannot drift apart. See that class for why #304 is still open.
@@ -311,7 +315,7 @@ public class RadiologyPaymentTaskProcessor implements Processor {
         Object[] lines = odooClient.searchAndRead(
                 Constants.SALE_ORDER_LINE_MODEL,
                 lineCriteria,
-                Arrays.asList("id", "name", "qty_invoiced", "order_id", "create_date"));
+                RadiologyPaymentEvidenceHandler.LINE_FIELDS);
 
         log.info("DEBUG: lines found = {}", lines == null ? "null" : lines.length);
         if (lines == null || lines.length == 0) {
@@ -406,37 +410,15 @@ public class RadiologyPaymentTaskProcessor implements Processor {
             }
         }
 
-        Object qtyInvoiced = mostRecentLine.get("qty_invoiced");
-        double qty = qtyInvoiced instanceof Number ? ((Number) qtyInvoiced).doubleValue() : 0;
-        if (qty <= 0) {
-            return OdooOrderState.PENDING;
+        // Paid means the invoice carrying THIS line is paid - not any paid invoice on the sale order.
+        // Searching invoices by invoice_origin let an auto-paid 0 BIF down payment on S03007 accept
+        // the RX03 order whose own invoice was unpaid (UAT, #322 attempt 2). The rule is shared with
+        // the unpaid-imaging audit so the two cannot disagree; see RadiologyPaymentEvidenceHandler.
+        if (paymentEvidenceHandler.isLinePaid(mostRecentLine)) {
+            return OdooOrderState.CONFIRMED;
         }
-
-        if (orderName.isEmpty()) {
-            throw new IllegalStateException("Could not resolve order name for sale order line");
-        }
-
-        List<Object> invoiceCriteria = Arrays.asList(Arrays.asList("invoice_origin", "=", orderName));
-        Object[] invoices = odooClient.searchAndRead(
-                Constants.ACCOUNT_MOVE_MODEL,
-                invoiceCriteria,
-                Arrays.asList("name", "state", "payment_state", "amount_residual"));
-
-        log.info("DEBUG: invoices found = {}", invoices == null ? "null" : invoices.length);
-        if (invoices == null || invoices.length == 0) {
-            return OdooOrderState.PENDING;
-        }
-
-        for (Object invoiceObj : invoices) {
-            java.util.Map<?, ?> invoice = (java.util.Map<?, ?>) invoiceObj;
-            String paymentState = String.valueOf(invoice.get("payment_state"));
-            Object residualObj = invoice.get("amount_residual");
-            double residual = residualObj instanceof Number ? ((Number) residualObj).doubleValue() : -1;
-            if ("paid".equals(paymentState) && residual == 0.0) {
-                return OdooOrderState.CONFIRMED;
-            }
-        }
-
+        log.debug("Sale order line {} on {} has no paid invoice of its own - not yet confirmed",
+                mostRecentLine.get("id"), orderName);
         return OdooOrderState.PENDING;
     }
 }
