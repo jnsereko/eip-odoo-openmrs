@@ -27,20 +27,20 @@ import org.hl7.fhir.r4.model.ServiceRequest;
  * <p>The list is read from the {@value #PROPERTY} property - set it as the environment variable
  * {@code RADIOLOGY_CONCEPT_UUIDS}, a comma-separated list of concept uuids (UVL-EMR#253). The
  * Orthanc bridge reads the same variable, so setting it once for both containers keeps payment
- * gating and worklist creation on the same list. With no value it is {@link #DEFAULT_UUIDS}, the
- * list both bridges hard-coded before, so an unconfigured deployment behaves exactly as it did.
+ * gating and worklist creation on the same list. With no value it is {@link #DEFAULT_UUIDS}: the
+ * X-ray and CT concepts both bridges hard-coded before, plus the EC01/EC02 ultrasound concepts
+ * (UVL-EMR#304). The Orthanc bridge carries the same default.
  *
  * <p>A configured value that is blank or contains anything that is not a uuid is rejected as a
  * whole, with a WARN, and the default is used instead. It never becomes an empty or partial list:
  * an empty list would quietly drop every radiology order - no Task, no worklist entry, nothing
  * logged above INFO - which is the kind of silent failure this bridge has already had too many of.
  *
- * <p>This does NOT close issue #304. The Orthanc bridge still picks the modality by text heuristics
- * on the procedure name, and 13 ultrasound, CT and echocardiography concepts are in neither the
- * default list nor any site configuration yet. The durable fix is one shared definition both sides
- * read from the server (a concept set via FHIR ValueSet); this property is the step before that.
- * The imaging-gate frontend ({@code @jnsereko/esm-imaging-gate-app}, {@code config-schema.ts})
- * carries its own copy of the default list and must be kept in step by hand.
+ * <p>The Orthanc bridge takes the DICOM modality from the concept, so a concept added here by
+ * configuration also needs a modality there, or it falls back to a guess from the procedure name.
+ * The remaining ultrasound, CT and echocardiography concepts of #304 are not in the default; the
+ * durable fix is still one shared definition both sides read from the server (a concept set via
+ * FHIR ValueSet), and this property is the step before that.
  */
 @Slf4j
 public class RadiologyConcepts {
@@ -66,7 +66,9 @@ public class RadiologyConcepts {
             "d0b5d4a0-1005-0000-0000-000000000001",
             "d0b5d4a0-1006-0000-0000-000000000001",
             "d0b5d4a0-1007-0000-0000-000000000001",
-            "d0b5d4a0-1008-0000-0000-000000000001")));
+            "d0b5d4a0-1008-0000-0000-000000000001",
+            "8155e2e0-5b62-42bc-b47c-0702aaafe3df", // EC01 - Abdominal ultrasound
+            "521361cf-ce7d-49a6-9721-8ebad1b76702"))); // EC02 - Gastrointestinal ultrasound
 
     private final Set<String> uuids;
 

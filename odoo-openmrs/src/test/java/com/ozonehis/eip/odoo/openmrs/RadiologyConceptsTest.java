@@ -20,16 +20,23 @@ import org.junit.jupiter.api.Test;
 import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.env.SystemEnvironmentPropertySource;
 
-/** The radiology concept list is configurable, and never silently empty (UVL-EMR#253). */
+/**
+ * The radiology concept list is configurable and never silently empty (UVL-EMR#253), and includes
+ * the EC01/EC02 ultrasounds by default (UVL-EMR#304).
+ */
 class RadiologyConceptsTest {
 
     private static final String RX01 = "e3dea2c8-62c6-4487-bdaa-1d009642f7ad";
 
     private static final String RX02 = "82e7d36c-078d-40c6-9854-92b376099307";
 
+    private static final String EC01 = "8155e2e0-5b62-42bc-b47c-0702aaafe3df";
+
+    private static final String EC02 = "521361cf-ce7d-49a6-9721-8ebad1b76702";
+
     private static final String OTHER = "11111111-2222-3333-4444-555555555555";
 
-    /** The list both bridges hard-coded before #253. Changing it is #304, not a refactor. */
+    /** The list both bridges hard-coded before #253. */
     private static final Set<String> HARD_CODED_BEFORE_253 = new LinkedHashSet<>(Arrays.asList(
             "e3dea2c8-62c6-4487-bdaa-1d009642f7ad",
             "82e7d36c-078d-40c6-9854-92b376099307",
@@ -53,12 +60,28 @@ class RadiologyConceptsTest {
         return sr;
     }
 
+    /** The default since #304: the list before #253 plus the EC01/EC02 ultrasound concepts. */
+    private static final Set<String> DEFAULT_SINCE_304 = new LinkedHashSet<>(HARD_CODED_BEFORE_253);
+
+    static {
+        DEFAULT_SINCE_304.add(EC01);
+        DEFAULT_SINCE_304.add(EC02);
+    }
+
     @Test
-    void defaultIsExactlyTheFifteenConceptsHardCodedBefore() {
-        assertEquals(15, RadiologyConcepts.DEFAULT_UUIDS.size());
-        assertEquals(HARD_CODED_BEFORE_253, RadiologyConcepts.DEFAULT_UUIDS);
-        assertEquals(HARD_CODED_BEFORE_253, new RadiologyConcepts().getUuids());
-        assertEquals(HARD_CODED_BEFORE_253, new RadiologyConcepts(null).getUuids());
+    void defaultIsTheFifteenConceptsHardCodedBeforePlusTheTwoUltrasounds() {
+        assertEquals(17, RadiologyConcepts.DEFAULT_UUIDS.size());
+        assertEquals(DEFAULT_SINCE_304, RadiologyConcepts.DEFAULT_UUIDS);
+        assertEquals(DEFAULT_SINCE_304, new RadiologyConcepts().getUuids());
+        assertEquals(DEFAULT_SINCE_304, new RadiologyConcepts(null).getUuids());
+    }
+
+    @Test
+    void ultrasoundOrdersAreRadiologyByDefault() {
+        RadiologyConcepts concepts = new RadiologyConcepts();
+
+        assertTrue(concepts.isRadiologyOrder(order(EC01)));
+        assertTrue(concepts.isRadiologyOrder(order(EC02)));
     }
 
     @Test
@@ -76,7 +99,7 @@ class RadiologyConceptsTest {
     void blankConfigurationFallsBackToTheDefault() {
         for (String blank : new String[] {"", "   ", ",", " , ,"}) {
             RadiologyConcepts concepts = new RadiologyConcepts(blank);
-            assertEquals(HARD_CODED_BEFORE_253, concepts.getUuids(), "for '" + blank + "'");
+            assertEquals(DEFAULT_SINCE_304, concepts.getUuids(), "for '" + blank + "'");
             assertTrue(concepts.isRadiologyOrder(order(RX01)));
         }
     }
@@ -86,7 +109,7 @@ class RadiologyConceptsTest {
         // One typo must not leave a partial list: that would drop the mistyped concept in silence.
         RadiologyConcepts concepts = new RadiologyConcepts(RX02 + ",RX01," + OTHER);
 
-        assertEquals(HARD_CODED_BEFORE_253, concepts.getUuids());
+        assertEquals(DEFAULT_SINCE_304, concepts.getUuids());
         assertTrue(concepts.isRadiologyOrder(order(RX01)));
         assertFalse(concepts.isRadiologyOrder(order(OTHER)));
     }

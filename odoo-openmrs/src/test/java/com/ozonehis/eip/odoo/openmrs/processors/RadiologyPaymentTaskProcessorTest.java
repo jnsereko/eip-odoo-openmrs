@@ -51,7 +51,11 @@ class RadiologyPaymentTaskProcessorTest {
 
     private static final Date ORDERED = Date.from(java.time.Instant.parse("2026-09-10T08:00:00Z"));
 
+    private static final String EC01 = "8155e2e0-5b62-42bc-b47c-0702aaafe3df";
+
     private FakeOdoo odoo;
+
+    private IQuery<Bundle> srQuery;
 
     private TaskHandler taskHandler;
 
@@ -65,13 +69,13 @@ class RadiologyPaymentTaskProcessorTest {
         IGenericClient fhirClient = mock(IGenericClient.class);
         IUntypedQuery<IBaseBundle> untyped = mock(IUntypedQuery.class);
         IQuery<IBaseBundle> query = mock(IQuery.class);
-        IQuery<Bundle> srQuery = mock(IQuery.class);
+        srQuery = mock(IQuery.class);
         when(fhirClient.search()).thenReturn((IUntypedQuery) untyped);
         when(untyped.forResource(ServiceRequest.class)).thenReturn(query);
         when(query.where(any(ICriterion.class))).thenReturn(query);
         when(query.returnBundle(Bundle.class)).thenReturn(srQuery);
         Bundle bundle = new Bundle();
-        bundle.addEntry().setResource(serviceRequest());
+        bundle.addEntry().setResource(serviceRequest(RadiologyConcepts.DEFAULT_UUIDS.iterator().next(), PROCEDURE));
         when(srQuery.execute()).thenReturn(bundle);
 
         task = new Task();
@@ -100,11 +104,11 @@ class RadiologyPaymentTaskProcessorTest {
         processor.setRadiologyConcepts(new RadiologyConcepts());
     }
 
-    private static ServiceRequest serviceRequest() {
+    private static ServiceRequest serviceRequest(String concept, String procedure) {
         ServiceRequest sr = new ServiceRequest();
         sr.setId(SR_ID);
         sr.setStatus(ServiceRequest.ServiceRequestStatus.ACTIVE);
-        sr.getCode().setText(PROCEDURE).addCoding().setCode(RadiologyConcepts.DEFAULT_UUIDS.iterator().next());
+        sr.getCode().setText(procedure).addCoding().setCode(concept);
         sr.setSubject(new Reference("Patient/" + FakeOdoo.PATIENT));
         sr.setEncounter(new Reference("Encounter/" + ENCOUNTER));
         sr.getMeta().setLastUpdated(ORDERED);
@@ -173,5 +177,20 @@ class RadiologyPaymentTaskProcessorTest {
         poll();
 
         verify(taskHandler, never()).updateTaskStatus(any(), eq(Task.TaskStatus.ACCEPTED));
+    }
+
+    /** UVL-EMR#304: an ultrasound order was not a radiology order, so it never got a Task. */
+    @Test
+    void paidUltrasoundOrderIsAccepted() {
+        String ultrasound = "EC01 - Abdominal ultrasound";
+        Bundle bundle = new Bundle();
+        bundle.addEntry().setResource(serviceRequest(EC01, ultrasound));
+        when(srQuery.execute()).thenReturn(bundle);
+        odoo.line(6200, 1, ultrasound, 1, "2026-09-10 08:00:05");
+        odoo.paidInvoice(9, "INV/2026/09/0009", 6200);
+
+        poll();
+
+        verify(taskHandler).updateTaskStatus(task, Task.TaskStatus.ACCEPTED);
     }
 }
