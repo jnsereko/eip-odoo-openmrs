@@ -7,10 +7,14 @@
  */
 package com.ozonehis.eip.odoo.openmrs;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
+import java.util.regex.Pattern;
+import lombok.extern.slf4j.Slf4j;
 import org.hl7.fhir.r4.model.ServiceRequest;
 
 /**
@@ -20,19 +24,34 @@ import org.hl7.fhir.r4.model.ServiceRequest;
  * inline in {@code RadiologyPaymentTaskProcessor}, and adding a second consumer would have made a
  * second copy.
  *
- * <p>This does NOT close issue #304. The Orthanc bridge still decides the same question by text
- * heuristics on the concept code ({@code XR}, {@code ct}, {@code ultrasound}, …) while this list is
- * an allow-list of X-ray concepts, so the two repositories still disagree: 13 ultrasound, CT and
- * echocardiography concepts are in neither payment gating nor worklist creation. The real fix is one
- * shared definition both sides read from the server — a concept set, an order type, or a concept
- * attribute — rather than a list in a jar. Until then, anything added here must be added to the
- * Orthanc bridge by hand.
+ * <p>The list is read from the {@value #PROPERTY} property - set it as the environment variable
+ * {@code RADIOLOGY_CONCEPT_UUIDS}, a comma-separated list of concept uuids (UVL-EMR#253). The
+ * Orthanc bridge reads the same variable, so setting it once for both containers keeps payment
+ * gating and worklist creation on the same list. With no value it is {@link #DEFAULT_UUIDS}, the
+ * list both bridges hard-coded before, so an unconfigured deployment behaves exactly as it did.
+ *
+ * <p>A configured value that is blank or contains anything that is not a uuid is rejected as a
+ * whole, with a WARN, and the default is used instead. It never becomes an empty or partial list:
+ * an empty list would quietly drop every radiology order - no Task, no worklist entry, nothing
+ * logged above INFO - which is the kind of silent failure this bridge has already had too many of.
+ *
+ * <p>This does NOT close issue #304. The Orthanc bridge still picks the modality by text heuristics
+ * on the procedure name, and 13 ultrasound, CT and echocardiography concepts are in neither the
+ * default list nor any site configuration yet. The durable fix is one shared definition both sides
+ * read from the server (a concept set via FHIR ValueSet); this property is the step before that.
+ * The imaging-gate frontend ({@code @jnsereko/esm-imaging-gate-app}, {@code config-schema.ts})
+ * carries its own copy of the default list and must be kept in step by hand.
  */
-public final class RadiologyConcepts {
+@Slf4j
+public class RadiologyConcepts {
 
-    private RadiologyConcepts() {}
+    /** Property the list is read from. Spring maps the environment variable RADIOLOGY_CONCEPT_UUIDS onto it. */
+    public static final String PROPERTY = "radiology.concept.uuids";
 
-    public static final Set<String> UUIDS = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
+    private static final Pattern UUID = Pattern.compile(
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+
+    public static final Set<String> DEFAULT_UUIDS = Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
             "e3dea2c8-62c6-4487-bdaa-1d009642f7ad", // RX01 - Chest X-ray
             "82e7d36c-078d-40c6-9854-92b376099307", // RX02 - Abdominal X-ray
             "701257a2-885e-4249-8319-d9597d2970af", // RX03 - Bone X-ray
@@ -49,11 +68,59 @@ public final class RadiologyConcepts {
             "d0b5d4a0-1007-0000-0000-000000000001",
             "d0b5d4a0-1008-0000-0000-000000000001")));
 
-    public static boolean isRadiologyOrder(ServiceRequest serviceRequest) {
+    private final Set<String> uuids;
+
+    /** The default list, as before this was configurable. */
+    public RadiologyConcepts() {
+        this(null);
+    }
+
+    /**
+     * @param configured the raw {@value #PROPERTY} value; null or blank means "use the default"
+     */
+    public RadiologyConcepts(String configured) {
+        this.uuids = resolve(configured);
+    }
+
+    public Set<String> getUuids() {
+        return uuids;
+    }
+
+    public boolean isRadiologyOrder(ServiceRequest serviceRequest) {
         if (serviceRequest == null || serviceRequest.getCode() == null) {
             return false;
         }
-        return serviceRequest.getCode().getCoding().stream()
-                .anyMatch(coding -> UUIDS.contains(coding.getCode()));
+        return serviceRequest.getCode().getCoding().stream().anyMatch(coding -> uuids.contains(coding.getCode()));
+    }
+
+    private static Set<String> resolve(String configured) {
+        if (configured == null || configured.trim().isEmpty()) {
+            log.info("{} not set - using the default {} radiology concepts", PROPERTY, DEFAULT_UUIDS.size());
+            return DEFAULT_UUIDS;
+        }
+        Set<String> parsed = new LinkedHashSet<>();
+        List<String> invalid = new ArrayList<>();
+        for (String entry : configured.split(",")) {
+            String uuid = entry.trim();
+            if (uuid.isEmpty()) {
+                continue;
+            }
+            if (UUID.matcher(uuid).matches()) {
+                parsed.add(uuid);
+            } else {
+                invalid.add(uuid);
+            }
+        }
+        if (!invalid.isEmpty() || parsed.isEmpty()) {
+            log.warn(
+                    "{} is invalid ({}) - IGNORING it and using the default {} radiology concepts. Value was '{}'",
+                    PROPERTY,
+                    invalid.isEmpty() ? "no uuids in it" : "not uuids: " + invalid,
+                    DEFAULT_UUIDS.size(),
+                    configured);
+            return DEFAULT_UUIDS;
+        }
+        log.info("{} set - using {} configured radiology concepts: {}", PROPERTY, parsed.size(), parsed);
+        return Collections.unmodifiableSet(parsed);
     }
 }

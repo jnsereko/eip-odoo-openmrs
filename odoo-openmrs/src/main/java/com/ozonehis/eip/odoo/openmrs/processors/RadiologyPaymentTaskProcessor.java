@@ -90,8 +90,11 @@ public class RadiologyPaymentTaskProcessor implements Processor {
     @Autowired
     private RadiologyPaymentEvidenceHandler paymentEvidenceHandler;
 
-    // The radiology concept list now lives in RadiologyConcepts, so this processor and the
-    // unpaid-imaging audit cannot drift apart. See that class for why #304 is still open.
+    // The radiology concept list lives in RadiologyConcepts, so this processor and the
+    // unpaid-imaging audit cannot drift apart. It is configurable (RADIOLOGY_CONCEPT_UUIDS); see
+    // that class for the default and for why #304 is still open.
+    @Autowired
+    private RadiologyConcepts radiologyConcepts;
 
     // How far back each poll looks.
     //
@@ -221,7 +224,7 @@ public class RadiologyPaymentTaskProcessor implements Processor {
     }
 
     private boolean isRadiologyOrder(ServiceRequest serviceRequest) {
-        return RadiologyConcepts.isRadiologyOrder(serviceRequest);
+        return radiologyConcepts.isRadiologyOrder(serviceRequest);
     }
 
     /**

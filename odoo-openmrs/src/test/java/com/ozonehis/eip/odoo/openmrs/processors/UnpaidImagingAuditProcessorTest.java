@@ -115,13 +115,14 @@ class UnpaidImagingAuditProcessorTest {
         processor.setTaskHandler(mock(TaskHandler.class));
         processor.setEncounterHandler(encounterHandler);
         processor.setPaymentEvidenceHandler(evidence);
+        processor.setRadiologyConcepts(new RadiologyConcepts());
     }
 
     private static ServiceRequest serviceRequest() {
         ServiceRequest sr = new ServiceRequest();
         sr.setId(SR_ID);
         sr.setStatus(ServiceRequest.ServiceRequestStatus.COMPLETED);
-        sr.getCode().setText(PROCEDURE).addCoding().setCode(RadiologyConcepts.UUIDS.iterator().next());
+        sr.getCode().setText(PROCEDURE).addCoding().setCode(RadiologyConcepts.DEFAULT_UUIDS.iterator().next());
         sr.setSubject(new Reference("Patient/" + PATIENT));
         sr.setEncounter(new Reference("Encounter/" + ENCOUNTER));
         sr.setOccurrence(new Period().setStart(ORDERED));

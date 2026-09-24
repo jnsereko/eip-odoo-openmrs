@@ -97,13 +97,14 @@ class RadiologyPaymentTaskProcessorTest {
         processor.setTaskHandler(taskHandler);
         processor.setEncounterHandler(encounterHandler);
         processor.setPaymentEvidenceHandler(evidence);
+        processor.setRadiologyConcepts(new RadiologyConcepts());
     }
 
     private static ServiceRequest serviceRequest() {
         ServiceRequest sr = new ServiceRequest();
         sr.setId(SR_ID);
         sr.setStatus(ServiceRequest.ServiceRequestStatus.ACTIVE);
-        sr.getCode().setText(PROCEDURE).addCoding().setCode(RadiologyConcepts.UUIDS.iterator().next());
+        sr.getCode().setText(PROCEDURE).addCoding().setCode(RadiologyConcepts.DEFAULT_UUIDS.iterator().next());
         sr.setSubject(new Reference("Patient/" + FakeOdoo.PATIENT));
         sr.setEncounter(new Reference("Encounter/" + ENCOUNTER));
         sr.getMeta().setLastUpdated(ORDERED);

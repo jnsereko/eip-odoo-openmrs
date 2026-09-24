@@ -73,6 +73,9 @@ public class UnpaidImagingAuditProcessor implements Processor {
     @Autowired
     private RadiologyPaymentEvidenceHandler paymentEvidenceHandler;
 
+    @Autowired
+    private RadiologyConcepts radiologyConcepts;
+
     /** Upper bound on Task search pages followed per run, so a paging loop cannot run away. */
     private static final int MAX_TASK_PAGES = 100;
 
@@ -167,7 +170,7 @@ public class UnpaidImagingAuditProcessor implements Processor {
             if (serviceRequest.getStatus() != ServiceRequest.ServiceRequestStatus.COMPLETED) {
                 continue;
             }
-            if (!RadiologyConcepts.isRadiologyOrder(serviceRequest)) {
+            if (!radiologyConcepts.isRadiologyOrder(serviceRequest)) {
                 continue;
             }
 
@@ -306,7 +309,7 @@ public class UnpaidImagingAuditProcessor implements Processor {
                     serviceRequestId, taskId, e.getMessage());
             return null;
         }
-        if (!RadiologyConcepts.isRadiologyOrder(serviceRequest)) {
+        if (!radiologyConcepts.isRadiologyOrder(serviceRequest)) {
             return null;
         }
 
