@@ -42,23 +42,25 @@ public class TaskHandler {
     /**
      * Finds the existing Task for a given ServiceRequest, if one exists.
      *
-     * <p>The basedOn link is re-checked here rather than left to the server. OpenMRS's FHIR2 module
-     * accepts {@code ?based-on=} and then ignores it - a query with an all-zero uuid returns every
-     * Task in the system. Combined with findFirst(), that made this method answer "yes, a Task
-     * already exists" for EVERY ServiceRequest as soon as one Task existed anywhere, so no order
-     * after the first ever got a Task of its own and none of them could ever reach the modality
-     * worklist. Measured on UAT: an RX01 order, paid in Odoo, was skipped with
-     * "existingTask status=ACCEPTED" while the only Task in the system belonged to a different
-     * patient's order.
+     * <p>The search uses the typed form {@code ?based-on=ServiceRequest/<uuid>}. OpenMRS's FHIR2
+     * module silently ignores the bare-uuid form {@code ?based-on=<uuid>} and returns every Task in
+     * the system: measured on UAT, each such call took 0.46-0.54 s and returned all 22 Tasks, and the
+     * two bridges made ~4,100 of them per 2 h at idle, holding OpenMRS at a full core. The typed form
+     * is honoured and returns only the matching Task in 0.03-0.05 s.
      *
-     * <p>The query parameter is left in place - harmless, and a real optimisation if OpenMRS ever
-     * implements it - but the filter below is what makes the answer correct.
+     * <p>The basedOn link is still re-checked here rather than left to the server. When the search
+     * was ignored, findFirst() made this method answer "yes, a Task already exists" for EVERY
+     * ServiceRequest as soon as one Task existed anywhere, so no order after the first ever got a
+     * Task of its own and none of them could ever reach the modality worklist. Measured on UAT: an
+     * RX01 order, paid in Odoo, was skipped with "existingTask status=ACCEPTED" while the only Task
+     * in the system belonged to a different patient's order. The filter below keeps the answer
+     * correct whatever the server does with the parameter.
      */
     public Task getTaskByServiceRequestId(String serviceRequestId) {
         Bundle bundle = openmrsFhirClient
                 .search()
                 .forResource(Task.class)
-                .where(Task.BASED_ON.hasId(serviceRequestId))
+                .where(Task.BASED_ON.hasId("ServiceRequest/" + serviceRequestId))
                 .returnBundle(Bundle.class)
                 .execute();
 
