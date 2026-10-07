@@ -10,6 +10,7 @@ package com.ozonehis.eip.odoo.openmrs.processors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -18,6 +19,7 @@ import static org.openmrs.eip.fhir.Constants.HEADER_FHIR_EVENT_TYPE;
 
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.PartnerHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.SaleOrderHandler;
+import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.OrderHandler;
 import com.ozonehis.eip.odoo.openmrs.model.Partner;
 import com.ozonehis.eip.odoo.openmrs.model.SaleOrder;
 import java.util.ArrayList;
@@ -43,11 +45,16 @@ class ServiceRequestProcessorTest extends BaseProcessorTest {
 
     private static final String PATIENT_ID = "patient-id-987";
 
+    private static final String SERVICE_REQUEST_ID = "service-request-id-123";
+
     @Mock
     private SaleOrderHandler saleOrderHandler;
 
     @Mock
     private PartnerHandler partnerHandler;
+
+    @Mock
+    private OrderHandler orderHandler;
 
     @InjectMocks
     private ServiceRequestProcessor serviceRequestProcessor;
@@ -174,7 +181,7 @@ class ServiceRequestProcessorTest extends BaseProcessorTest {
 
     // Test for handling completed status
     @Test
-    void shouldUpdateSaleOrderWhenServiceRequestIsCompleted() {
+    void shouldUpdateSaleOrderWhenServiceRequestIsCompleted() throws Exception {
         // Arrange
         Patient patient = new Patient();
         patient.setId(PATIENT_ID);
@@ -202,6 +209,7 @@ class ServiceRequestProcessorTest extends BaseProcessorTest {
         when(partnerHandler.createOrUpdatePartner(any(), eq(patient), any())).thenReturn(partner);
         when(saleOrderHandler.getDraftSaleOrderIfExistsByVisitId(eq(ENCOUNTER_VISIT_ID), any()))
                 .thenReturn(saleOrder);
+        when(orderHandler.isFulfilled(any())).thenReturn(true);
 
         // Act
         serviceRequestProcessor.process(exchange);
@@ -217,5 +225,108 @@ class ServiceRequestProcessorTest extends BaseProcessorTest {
                         eq(PATIENT_ID),
                         any(),
                         any());
+    }
+
+    // UVL-EMR #386 / #254: FHIR2 reads a discontinued order as COMPLETED even though nothing was done.
+    @Test
+    void shouldRemoveSaleOrderLineWhenDiscontinuedOrderWasNotFulfilled() throws Exception {
+        // Arrange
+        Patient patient = new Patient();
+        patient.setId(PATIENT_ID);
+        Exchange exchange = createExchange(
+                discontinuedServiceRequestBundle(patient, ServiceRequest.ServiceRequestStatus.COMPLETED), "d");
+        mockPartner(patient);
+        when(orderHandler.getFulfillerStatus(SERVICE_REQUEST_ID)).thenReturn(null);
+
+        // Act
+        serviceRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, times(1))
+                .removeSaleOrderLineFromQuotation(any(ServiceRequest.class), eq(ENCOUNTER_VISIT_ID), any(), any());
+        verify(saleOrderHandler, times(1))
+                .cancelSaleOrderWhenNoSaleOrderLine(eq(PARTNER_ID), eq(ENCOUNTER_VISIT_ID), any(), any());
+    }
+
+    @Test
+    void shouldRemoveSaleOrderLineWhenDiscontinuedOrderWasOnlyInProgress() throws Exception {
+        // Arrange
+        Patient patient = new Patient();
+        patient.setId(PATIENT_ID);
+        Exchange exchange = createExchange(
+                discontinuedServiceRequestBundle(patient, ServiceRequest.ServiceRequestStatus.COMPLETED), "d");
+        mockPartner(patient);
+        when(orderHandler.getFulfillerStatus(SERVICE_REQUEST_ID)).thenReturn("IN_PROGRESS");
+
+        // Act
+        serviceRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, times(1))
+                .removeSaleOrderLineFromQuotation(any(ServiceRequest.class), eq(ENCOUNTER_VISIT_ID), any(), any());
+    }
+
+    @Test
+    void shouldKeepSaleOrderLineWhenDiscontinuedOrderWasFulfilled() throws Exception {
+        // Arrange: the lab app discontinues an order right after its result is entered
+        Patient patient = new Patient();
+        patient.setId(PATIENT_ID);
+        Exchange exchange = createExchange(
+                discontinuedServiceRequestBundle(patient, ServiceRequest.ServiceRequestStatus.COMPLETED), "d");
+        mockPartner(patient);
+        when(orderHandler.getFulfillerStatus(SERVICE_REQUEST_ID)).thenReturn(OrderHandler.FULFILLER_STATUS_COMPLETED);
+
+        // Act
+        serviceRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, never()).removeSaleOrderLineFromQuotation(any(), any(), any(), any());
+        verify(saleOrderHandler, never()).deleteSaleOrderLine(any(), any(), any(), any());
+        verify(saleOrderHandler, never()).cancelSaleOrderWhenNoSaleOrderLine(any(Integer.class), any(), any(), any());
+    }
+
+    @Test
+    void shouldNotReAddSaleOrderLineWhenStoppedOrderWasNotFulfilled() throws Exception {
+        // Arrange: the update event of the discontinued order itself, which FHIR2 reads as COMPLETED
+        Patient patient = new Patient();
+        patient.setId(PATIENT_ID);
+        Exchange exchange = createExchange(
+                discontinuedServiceRequestBundle(patient, ServiceRequest.ServiceRequestStatus.COMPLETED), "u");
+        mockPartner(patient);
+        when(orderHandler.isFulfilled(SERVICE_REQUEST_ID)).thenReturn(false);
+
+        // Act
+        serviceRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, never())
+                .updateSaleOrderIfExistsWithSaleOrderLine(any(), any(), any(), any(Integer.class), any(), any(), any());
+        verify(saleOrderHandler, never())
+                .createSaleOrderWithSaleOrderLine(any(), any(), any(), any(), any(), any(), any());
+        verify(saleOrderHandler, never()).deleteSaleOrderLine(any(), any(), any(), any());
+        verify(saleOrderHandler, never()).removeSaleOrderLineFromQuotation(any(), any(), any(), any());
+    }
+
+    private Bundle discontinuedServiceRequestBundle(Patient patient, ServiceRequest.ServiceRequestStatus status) {
+        Encounter encounter = new Encounter();
+        encounter.setPartOf(new Reference(ENCOUNTER_REFERENCE_ID));
+        ServiceRequest serviceRequest = new ServiceRequest();
+        serviceRequest.setId(SERVICE_REQUEST_ID);
+        serviceRequest.setStatus(status);
+        serviceRequest.setIntent(ServiceRequest.ServiceRequestIntent.ORDER);
+
+        Bundle bundle = new Bundle();
+        List<Bundle.BundleEntryComponent> entries = new ArrayList<>();
+        entries.add(new Bundle.BundleEntryComponent().setResource(patient));
+        entries.add(new Bundle.BundleEntryComponent().setResource(encounter));
+        entries.add(new Bundle.BundleEntryComponent().setResource(serviceRequest));
+        bundle.setEntry(entries);
+        return bundle;
+    }
+
+    private void mockPartner(Patient patient) {
+        Partner partner = new Partner();
+        partner.setPartnerId(PARTNER_ID);
+        when(partnerHandler.createOrUpdatePartner(any(), eq(patient), any())).thenReturn(partner);
     }
 }
