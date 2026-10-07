@@ -9,11 +9,15 @@ package com.ozonehis.eip.odoo.openmrs.handlers;
 
 import static java.util.Arrays.asList;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -26,6 +30,7 @@ import com.ozonehis.eip.odoo.openmrs.handlers.odoo.ProductHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.SaleOrderHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.SaleOrderLineHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.ObservationHandler;
+import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.OrderHandler;
 import com.ozonehis.eip.odoo.openmrs.mapper.odoo.SaleOrderMapper;
 import com.ozonehis.eip.odoo.openmrs.model.Partner;
 import com.ozonehis.eip.odoo.openmrs.model.Product;
@@ -40,6 +45,7 @@ import org.hl7.fhir.r4.model.MedicationRequest;
 import org.hl7.fhir.r4.model.Observation;
 import org.hl7.fhir.r4.model.Quantity;
 import org.hl7.fhir.r4.model.Resource;
+import org.hl7.fhir.r4.model.ServiceRequest;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -65,6 +71,9 @@ class SaleOrderHandlerTest {
 
     @Mock
     private ObservationHandler observationHandler;
+
+    @Mock
+    private OrderHandler orderHandler;
 
     private OdooUtils odooUtils;
 
@@ -338,5 +347,326 @@ class SaleOrderHandlerTest {
 
         // Assert
         assertNull(result);
+    }
+
+    // UVL-EMR #386: a discontinued order's line comes off a quotation that is still a draft
+    @Test
+    public void shouldRemoveSaleOrderLineFromDraftQuotation() {
+        // Setup
+        Resource resource = new ServiceRequest();
+        Product product = new Product();
+        product.setProductResId(123);
+        SaleOrderLine saleOrderLine = new SaleOrderLine();
+        saleOrderLine.setSaleOrderLineId(6300);
+        mockVisitSaleOrders(resource, product, Map.of("id", 1, "name", "S00001", "state", "draft"));
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(saleOrderLine);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.removeSaleOrderLineFromQuotation(resource, VISIT_ID_1, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderLineHandler, times(1))
+                .sendSaleOrderLine(producerTemplate, "direct:odoo-delete-sale-order-line-route", saleOrderLine);
+    }
+
+    @Test
+    public void shouldRemoveSaleOrderLineFromSentQuotation() {
+        // Setup
+        Resource resource = new ServiceRequest();
+        Product product = new Product();
+        product.setProductResId(123);
+        SaleOrderLine saleOrderLine = new SaleOrderLine();
+        saleOrderLine.setSaleOrderLineId(6300);
+        mockVisitSaleOrders(resource, product, Map.of("id", 1, "name", "S00001", "state", "sent"));
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(saleOrderLine);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.removeSaleOrderLineFromQuotation(resource, VISIT_ID_1, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderLineHandler, times(1))
+                .sendSaleOrderLine(producerTemplate, "direct:odoo-delete-sale-order-line-route", saleOrderLine);
+    }
+
+    @Test
+    public void shouldNeverChangeAConfirmedSaleOrder() {
+        // Setup
+        Resource resource = new ServiceRequest();
+        Product product = new Product();
+        product.setProductResId(123);
+        SaleOrderLine saleOrderLine = new SaleOrderLine();
+        saleOrderLine.setSaleOrderLineId(6305);
+        mockVisitSaleOrders(resource, product, Map.of("id", 2, "name", "S00002", "state", "sale"));
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(2, 123)).thenReturn(saleOrderLine);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.removeSaleOrderLineFromQuotation(resource, VISIT_ID_1, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderLineHandler, never()).sendSaleOrderLine(any(), any(), any());
+        Mockito.verifyNoInteractions(producerTemplate);
+    }
+
+    @Test
+    public void shouldSetQuantityToZeroWhenTheQuotationLineCannotBeDeleted() {
+        // Setup
+        Resource resource = new ServiceRequest();
+        Product product = new Product();
+        product.setProductResId(123);
+        SaleOrderLine saleOrderLine = new SaleOrderLine();
+        saleOrderLine.setSaleOrderLineId(6300);
+        mockVisitSaleOrders(resource, product, Map.of("id", 1, "name", "S00001", "state", "draft"));
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(saleOrderLine);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+        doThrow(new RuntimeException("unlink refused"))
+                .when(saleOrderLineHandler)
+                .sendSaleOrderLine(producerTemplate, "direct:odoo-delete-sale-order-line-route", saleOrderLine);
+
+        // Act
+        saleOrderHandler.removeSaleOrderLineFromQuotation(resource, VISIT_ID_1, null, producerTemplate);
+
+        // Verify
+        SaleOrderLine zeroQuantity = new SaleOrderLine();
+        zeroQuantity.setSaleOrderLineId(6300);
+        zeroQuantity.setSaleOrderLineProductUomQty(0f);
+        verify(saleOrderLineHandler, times(1))
+                .sendSaleOrderLine(producerTemplate, "direct:odoo-update-sale-order-line-route", zeroQuantity);
+    }
+
+    @Test
+    public void shouldOnlyTouchTheQuotationWhenTheVisitAlsoHasAConfirmedSaleOrder() {
+        // Setup
+        Resource resource = new ServiceRequest();
+        Product product = new Product();
+        product.setProductResId(123);
+        SaleOrderLine quotationLine = new SaleOrderLine();
+        quotationLine.setSaleOrderLineId(7001);
+        mockVisitSaleOrders(
+                resource,
+                product,
+                Map.of("id", 1, "name", "S00001", "state", "sale"),
+                Map.of("id", 2, "name", "S00002", "state", "draft"));
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(null);
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(2, 123)).thenReturn(quotationLine);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.removeSaleOrderLineFromQuotation(resource, VISIT_ID_1, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderLineHandler, times(1))
+                .sendSaleOrderLine(producerTemplate, "direct:odoo-delete-sale-order-line-route", quotationLine);
+    }
+
+    // UVL-EMR #360: a second order of the same test on the same visit raises the line's quantity
+    @Test
+    public void shouldCountARepeatOfATestAlreadyOnTheQuotation() throws Exception {
+        // Setup
+        ServiceRequest repeat = serviceRequest("repeat-order");
+        SaleOrder quotation = quotation(1);
+        SaleOrderLine line = quotationLine(6300, 1f);
+        mockTestLine(repeat, 1, line);
+        when(orderHandler.countBillableOrdersInVisit("repeat-order")).thenReturn(2);
+        mockVisitLinesOfTest(visitLine(6300, 1, 1.0));
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.updateSaleOrderIfExistsWithSaleOrderLine(
+                repeat, quotation, VISIT_ID_1, PARTNER_ID, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        SaleOrderLine update = new SaleOrderLine();
+        update.setSaleOrderLineId(6300);
+        update.setSaleOrderLineProductUomQty(2f);
+        verify(saleOrderLineHandler, times(1))
+                .sendSaleOrderLine(producerTemplate, "direct:odoo-update-sale-order-line-route", update);
+        verify(producerTemplate, never()).sendBody(eq("direct:odoo-create-sale-order-line-route"), any());
+    }
+
+    // The same order's create and update events, or a replay, must not bill it twice
+    @Test
+    public void shouldNotChangeTheQuantityWhenTheSameOrderIsProcessedAgain() throws Exception {
+        // Setup
+        ServiceRequest order = serviceRequest("first-order");
+        mockTestLine(order, 1, quotationLine(6300, 2f));
+        when(orderHandler.countBillableOrdersInVisit("first-order")).thenReturn(2);
+        mockVisitLinesOfTest(visitLine(6300, 1, 2.0));
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.updateSaleOrderIfExistsWithSaleOrderLine(
+                order, quotation(1), VISIT_ID_1, PARTNER_ID, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderLineHandler, never()).sendSaleOrderLine(any(), any(), any());
+        Mockito.verifyNoInteractions(producerTemplate);
+    }
+
+    // The first order is on a confirmed sale order: the new quotation bills only the repeat
+    @Test
+    public void shouldNotBillAgainWhatAConfirmedSaleOrderOfTheVisitAlreadyBills() throws Exception {
+        // Setup
+        ServiceRequest repeat = serviceRequest("repeat-order");
+        SaleOrder quotation = quotation(2);
+        mockTestLine(repeat, 2, null);
+        when(orderHandler.countBillableOrdersInVisit("repeat-order")).thenReturn(2);
+        mockVisitLinesOfTest(visitLine(6300, 1, 1.0));
+        SaleOrderLine newLine = new SaleOrderLine();
+        newLine.setSaleOrderLineProductUomQty(1f);
+        when(saleOrderLineHandler.buildSaleOrderLineIfProductExists(repeat, quotation))
+                .thenReturn(newLine);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.updateSaleOrderIfExistsWithSaleOrderLine(
+                repeat, quotation, VISIT_ID_1, PARTNER_ID, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verify(producerTemplate, times(1)).sendBody("direct:odoo-create-sale-order-line-route", newLine);
+        assertEquals(1f, newLine.getSaleOrderLineProductUomQty());
+    }
+
+    @Test
+    public void shouldAddNoLineWhenConfirmedSaleOrdersAlreadyBillEveryOrderOfTheTest() throws Exception {
+        // Setup
+        ServiceRequest order = serviceRequest("first-order");
+        SaleOrder quotation = quotation(2);
+        mockTestLine(order, 2, null);
+        when(orderHandler.countBillableOrdersInVisit("first-order")).thenReturn(1);
+        mockVisitLinesOfTest(visitLine(6300, 1, 1.0));
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.updateSaleOrderIfExistsWithSaleOrderLine(
+                order, quotation, VISIT_ID_1, PARTNER_ID, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderLineHandler, never()).buildSaleOrderLineIfProductExists(any(), any());
+        Mockito.verifyNoInteractions(producerTemplate);
+    }
+
+    // If OpenMRS cannot be asked, the line is left as it was before #360: one per test, unchanged
+    @Test
+    public void shouldLeaveTheQuantityAloneWhenTheOrdersCannotBeCounted() throws Exception {
+        // Setup
+        ServiceRequest repeat = serviceRequest("repeat-order");
+        mockTestLine(repeat, 1, quotationLine(6300, 1f));
+        when(orderHandler.countBillableOrdersInVisit("repeat-order")).thenThrow(new Exception("OpenMRS down"));
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.updateSaleOrderIfExistsWithSaleOrderLine(
+                repeat, quotation(1), VISIT_ID_1, PARTNER_ID, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderLineHandler, never()).sendSaleOrderLine(any(), any(), any());
+        Mockito.verifyNoInteractions(producerTemplate);
+    }
+
+    // UVL-EMR #360: one of two orders of the same test is discontinued before it is done
+    @Test
+    public void shouldLowerTheQuantityWhenOneOfTwoOrdersIsDiscontinued() throws Exception {
+        // Setup
+        ServiceRequest cancelled = serviceRequest("cancelled-order");
+        mockDraftQuotation(1);
+        mockTestLine(cancelled, 1, quotationLine(6300, 2f));
+        when(orderHandler.countBillableOrdersInVisit("cancelled-order")).thenReturn(1);
+        mockVisitLinesOfTest(visitLine(6300, 1, 2.0));
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        boolean kept =
+                saleOrderHandler.reduceServiceRequestLineQuantity(cancelled, VISIT_ID_1, null, producerTemplate);
+
+        // Verify
+        assertTrue(kept);
+        SaleOrderLine update = new SaleOrderLine();
+        update.setSaleOrderLineId(6300);
+        update.setSaleOrderLineProductUomQty(1f);
+        verify(saleOrderLineHandler, times(1))
+                .sendSaleOrderLine(producerTemplate, "direct:odoo-update-sale-order-line-route", update);
+    }
+
+    @Test
+    public void shouldLeaveTheRemovalToTheCallerWhenNoOtherOrderOfTheTestRemains() throws Exception {
+        // Setup
+        ServiceRequest cancelled = serviceRequest("cancelled-order");
+        mockDraftQuotation(1);
+        mockTestLine(cancelled, 1, quotationLine(6300, 1f));
+        when(orderHandler.countBillableOrdersInVisit("cancelled-order")).thenReturn(0);
+        mockVisitLinesOfTest(visitLine(6300, 1, 1.0));
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        boolean kept =
+                saleOrderHandler.reduceServiceRequestLineQuantity(cancelled, VISIT_ID_1, null, producerTemplate);
+
+        // Verify
+        assertFalse(kept);
+        verify(saleOrderLineHandler, never()).sendSaleOrderLine(any(), any(), any());
+    }
+
+    private static ServiceRequest serviceRequest(String id) {
+        ServiceRequest serviceRequest = new ServiceRequest();
+        serviceRequest.setId(id);
+        return serviceRequest;
+    }
+
+    private static SaleOrder quotation(int id) {
+        SaleOrder saleOrder = new SaleOrder();
+        saleOrder.setOrderId(id);
+        saleOrder.setPartnerWeight("70 kg");
+        return saleOrder;
+    }
+
+    private static SaleOrderLine quotationLine(int id, float quantity) {
+        SaleOrderLine line = new SaleOrderLine();
+        line.setSaleOrderLineId(id);
+        line.setSaleOrderLineProductUomQty(quantity);
+        return line;
+    }
+
+    private static Map<String, Object> visitLine(int id, int saleOrderId, double quantity) {
+        return Map.of("id", id, "order_id", new Object[] {saleOrderId, "S0000" + saleOrderId}, "product_uom_qty", quantity);
+    }
+
+    private void mockTestLine(ServiceRequest serviceRequest, int quotationId, SaleOrderLine line) {
+        Product product = new Product();
+        product.setProductResId(123);
+        when(productHandler.getProduct(serviceRequest)).thenReturn(product);
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(quotationId, 123)).thenReturn(line);
+    }
+
+    private void mockDraftQuotation(int id) {
+        when(odooClient.searchAndRead(
+                        eq(Constants.SALE_ORDER_MODEL),
+                        eq(List.of(asList("client_order_ref", "=", VISIT_ID_1), asList("state", "=", "draft"))),
+                        any()))
+                .thenReturn(new Object[] {getSaleOrderMap(id, VISIT_ID_1, "draft", PARTNER_ID)});
+    }
+
+    @SafeVarargs
+    private void mockVisitLinesOfTest(Map<String, Object>... lines) {
+        when(odooClient.searchAndRead(
+                        eq(Constants.SALE_ORDER_LINE_MODEL),
+                        eq(List.of(
+                                asList("order_id.client_order_ref", "=", VISIT_ID_1),
+                                asList("order_id.state", "!=", "cancel"),
+                                asList("product_id", "=", 123))),
+                        any()))
+                .thenReturn(lines);
+    }
+
+    @SafeVarargs
+    private void mockVisitSaleOrders(Resource resource, Product product, Map<String, Object>... saleOrders) {
+        when(productHandler.getProduct(resource)).thenReturn(product);
+        when(odooClient.searchAndRead(
+                        eq(Constants.SALE_ORDER_MODEL),
+                        eq(List.of(asList("client_order_ref", "=", VISIT_ID_1), asList("state", "!=", "cancel"))),
+                        any()))
+                .thenReturn(saleOrders);
     }
 }
