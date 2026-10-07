@@ -8,10 +8,13 @@
 package com.ozonehis.eip.odoo.openmrs.config;
 
 import ca.uhn.fhir.rest.client.api.IGenericClient;
+import com.ozonehis.eip.odoo.openmrs.FhirConceptSetMembers;
 import com.ozonehis.eip.odoo.openmrs.ProductSynchronizer;
 import com.ozonehis.eip.odoo.openmrs.RadiologyConcepts;
 import com.ozonehis.eip.odoo.openmrs.client.OdooFhirClient;
 import com.ozonehis.eip.odoo.openmrs.client.OpenmrsRestClient;
+import java.time.Clock;
+import java.time.Duration;
 import org.openmrs.eip.app.config.AppConfig;
 import org.openmrs.eip.fhir.spring.OpenmrsFhirAppConfig;
 import org.springframework.beans.factory.annotation.Value;
@@ -35,11 +38,23 @@ public class EIPAppConfig {
     }
 
     /**
-     * The radiology concept list, from RADIOLOGY_CONCEPT_UUIDS (see {@link RadiologyConcepts}). The
-     * empty default means "unset", which RadiologyConcepts turns into its built-in list.
+     * The radiology concept list (see {@link RadiologyConcepts}): the members of the concept set
+     * RADIOLOGY_CONCEPT_SET_UUID when it is set, read from OpenMRS FHIR and cached, otherwise
+     * RADIOLOGY_CONCEPT_UUIDS. Empty defaults mean "unset"; with neither, the built-in list.
      */
     @Bean
-    public RadiologyConcepts radiologyConcepts(@Value("${" + RadiologyConcepts.PROPERTY + ":}") String configured) {
-        return new RadiologyConcepts(configured);
+    public RadiologyConcepts radiologyConcepts(
+            @Value("${" + RadiologyConcepts.PROPERTY + ":}") String configured,
+            @Value("${" + RadiologyConcepts.SET_PROPERTY + ":}") String conceptSetUuid,
+            @Value("${" + RadiologyConcepts.CACHE_SECONDS_PROPERTY + ":" + RadiologyConcepts.DEFAULT_CACHE_SECONDS
+                            + "}")
+                    long cacheSeconds,
+            IGenericClient openmrsFhirClient) {
+        return new RadiologyConcepts(
+                configured,
+                conceptSetUuid,
+                new FhirConceptSetMembers(openmrsFhirClient),
+                Duration.ofSeconds(cacheSeconds),
+                Clock.systemUTC());
     }
 }
