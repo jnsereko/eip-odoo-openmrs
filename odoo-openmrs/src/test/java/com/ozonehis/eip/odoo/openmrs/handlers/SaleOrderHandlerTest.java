@@ -24,6 +24,7 @@ import static org.mockito.MockitoAnnotations.openMocks;
 import com.ozonehis.eip.odoo.openmrs.Constants;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
 import com.ozonehis.eip.odoo.openmrs.client.OdooUtils;
+import com.ozonehis.eip.odoo.openmrs.handlers.odoo.InsurancePayerHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.ProductHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.SaleOrderHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.SaleOrderLineHandler;
@@ -68,6 +69,9 @@ class SaleOrderHandlerTest {
 
     @Mock
     private ObservationHandler observationHandler;
+
+    @Mock
+    private InsurancePayerHandler insurancePayerHandler;
 
     private OdooUtils odooUtils;
 
@@ -232,9 +236,36 @@ class SaleOrderHandlerTest {
                 resource, encounter, partner, VISIT_ID_1, PATIENT_ID, null, producerTemplate);
 
         // Verify
+        verify(insurancePayerHandler, times(1)).applyVisitPayer(saleOrder, VISIT_ID_1);
         verify(producerTemplate, times(1))
                 .sendBodyAndHeaders("direct:odoo-create-sale-order-route", saleOrder, new HashMap<>());
         verify(producerTemplate, times(1)).sendBody("direct:odoo-create-sale-order-line-route", saleOrderLine);
+    }
+
+    @Test
+    public void shouldNotCreateSaleOrderWhenTheVisitsPayerHasNoPlan() {
+        // Setup
+        Encounter encounter = new Encounter();
+        SaleOrder saleOrder = getSaleOrder();
+        Resource resource = new MedicationRequest();
+        when(saleOrderMapper.toOdoo(encounter)).thenReturn(saleOrder);
+        when(observationHandler.getObservationBySubjectIDAndConceptID(eq(PATIENT_ID), any()))
+                .thenReturn(null);
+        doThrow(new EIPException("no plan")).when(insurancePayerHandler).applyVisitPayer(saleOrder, VISIT_ID_1);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        Partner partner = new Partner();
+        partner.setPartnerId(PARTNER_ID);
+        partner.setPartnerExternalId(PATIENT_IDENTIFIER);
+
+        // Act
+        assertThrows(
+                EIPException.class,
+                () -> saleOrderHandler.createSaleOrderWithSaleOrderLine(
+                        resource, encounter, partner, VISIT_ID_1, PATIENT_ID, null, producerTemplate));
+
+        // Verify
+        verify(producerTemplate, never()).sendBodyAndHeaders(eq("direct:odoo-create-sale-order-route"), any(), any());
     }
 
     @Test

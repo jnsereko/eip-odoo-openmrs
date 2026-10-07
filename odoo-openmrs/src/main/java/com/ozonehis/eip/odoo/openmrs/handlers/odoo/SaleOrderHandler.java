@@ -68,6 +68,9 @@ public class SaleOrderHandler {
     @Autowired
     private OdooUtils odooUtils;
 
+    @Autowired
+    private InsurancePayerHandler insurancePayerHandler;
+
     public List<String> orderDefaultAttributes;
 
     // Odoo sale order states that are still a quotation, so their lines may be changed
@@ -172,6 +175,9 @@ public class SaleOrderHandler {
         if (patientWeight != null) {
             newSaleOrder.setPartnerWeight(getPartnerWeight(patientID));
         }
+        // The plans that pay for the visit, from its payer. Set once, on the new quotation: a payer changed
+        // after the visit's first order is not applied to it.
+        insurancePayerHandler.applyVisitPayer(newSaleOrder, encounterVisitUuid);
 
         sendSaleOrder(producerTemplate, "direct:odoo-create-sale-order-route", newSaleOrder);
         log.debug(
