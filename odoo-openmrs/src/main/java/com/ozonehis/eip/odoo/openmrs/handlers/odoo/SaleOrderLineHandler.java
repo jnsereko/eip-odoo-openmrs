@@ -17,9 +17,12 @@ import com.ozonehis.eip.odoo.openmrs.model.Product;
 import com.ozonehis.eip.odoo.openmrs.model.SaleOrder;
 import com.ozonehis.eip.odoo.openmrs.model.SaleOrderLine;
 import com.ozonehis.eip.odoo.openmrs.model.Uom;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.camel.ProducerTemplate;
@@ -29,6 +32,7 @@ import org.hl7.fhir.r4.model.ServiceRequest;
 import org.hl7.fhir.r4.model.SupplyRequest;
 import org.openmrs.eip.EIPException;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 @Slf4j
@@ -50,6 +54,13 @@ public class SaleOrderLineHandler {
 
     @Autowired
     private OdooUtils odooUtils;
+
+    /**
+     * Dispensing units, as OpenMRS concept uuids, that measure an amount taken from a container rather than
+     * count containers: Milliliter, Gram, Drop... (UVL-EMR#385). Comma separated; empty by default.
+     */
+    @Value("${odoo.per.container.uoms:}")
+    private String perContainerUoms;
 
     public SaleOrderLine buildSaleOrderLineIfProductExists(Resource resource, SaleOrder saleOrder) {
         Product product = productHandler.getProduct(resource);
@@ -74,6 +85,17 @@ public class SaleOrderLineHandler {
         saleOrderLine.setSaleOrderLineOrderId(saleOrder.getOrderId());
         if (resource instanceof MedicationRequest || resource instanceof SupplyRequest) {
             String uomExternalId = (String) saleOrderLine.getSaleOrderLineProductUom();
+            if (resource instanceof MedicationRequest && isPerContainerUom(uomExternalId)) {
+                // A syrup prescribed as "10 mL" is sold as a bottle, priced per bottle: billing 10 of it bills
+                // ten bottles. One prescription is billed as one container; the prescribed amount stays in the
+                // line description, and the quantity can be raised on the quotation if more were dispensed.
+                log.info(
+                        "MedicationRequest {}: {} of unit {} billed as 1 container",
+                        resource.getIdPart(),
+                        saleOrderLine.getSaleOrderLineProductUomQty(),
+                        uomExternalId);
+                saleOrderLine.setSaleOrderLineProductUomQty(1f);
+            }
             Uom uom = uomHandler.getUom(uomExternalId);
             log.debug("SaleOrderLineHandler: Fetched Uom {}", uom);
             // Store Uom res_id in productUom to display unit in Odoo
@@ -84,6 +106,17 @@ public class SaleOrderLineHandler {
         }
 
         return saleOrderLine;
+    }
+
+    private boolean isPerContainerUom(String uomExternalId) {
+        if (uomExternalId == null || perContainerUoms == null || perContainerUoms.isBlank()) {
+            return false;
+        }
+        Set<String> uoms = Arrays.stream(perContainerUoms.split(","))
+                .map(String::trim)
+                .filter(uuid -> !uuid.isEmpty())
+                .collect(Collectors.toSet());
+        return uoms.contains(uomExternalId);
     }
 
     public SaleOrderLine getSaleOrderLineIfExists(int saleOrderId, int productId) {
