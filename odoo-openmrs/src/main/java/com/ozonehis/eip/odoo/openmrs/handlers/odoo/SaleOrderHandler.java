@@ -13,6 +13,7 @@ import com.ozonehis.eip.odoo.openmrs.Constants;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
 import com.ozonehis.eip.odoo.openmrs.client.OdooUtils;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.ObservationHandler;
+import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.OrderHandler;
 import com.ozonehis.eip.odoo.openmrs.mapper.odoo.SaleOrderMapper;
 import com.ozonehis.eip.odoo.openmrs.model.Partner;
 import com.ozonehis.eip.odoo.openmrs.model.Product;
@@ -28,6 +29,7 @@ import org.apache.camel.ProducerTemplate;
 import org.hl7.fhir.r4.model.Encounter;
 import org.hl7.fhir.r4.model.Observation;
 import org.hl7.fhir.r4.model.Resource;
+import org.hl7.fhir.r4.model.ServiceRequest;
 import org.openmrs.eip.EIPException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -67,6 +69,9 @@ public class SaleOrderHandler {
 
     @Autowired
     private OdooUtils odooUtils;
+
+    @Autowired
+    private OrderHandler orderHandler;
 
     public List<String> orderDefaultAttributes;
 
@@ -126,6 +131,32 @@ public class SaleOrderHandler {
             String patientID,
             Integer companyId,
             ProducerTemplate producerTemplate) {
+        Float serviceRequestQuantity = null;
+        if (resource instanceof ServiceRequest serviceRequest) {
+            Product product = productHandler.getProduct(resource);
+            if (product != null) {
+                SaleOrderLine existingLine = saleOrderLineHandler.getSaleOrderLineIfExists(
+                        saleOrder.getOrderId(), product.getProductResId());
+                serviceRequestQuantity = getServiceRequestQuantity(
+                        serviceRequest, product, saleOrder.getOrderId(), encounterVisitUuid, companyId);
+                if (existingLine != null) {
+                    // A repeat of a test already on the quotation (UVL-EMR#360): one line per test, counted.
+                    updateServiceRequestLineQuantity(
+                            serviceRequest, existingLine, serviceRequestQuantity, saleOrder, producerTemplate);
+                    return;
+                }
+                if (serviceRequestQuantity != null && serviceRequestQuantity <= 0) {
+                    log.info(
+                            "ServiceRequest {}: every order of this test in visit {} is already on a confirmed sale"
+                                    + " order. No line added to quotation {}.",
+                            serviceRequest.getIdPart(),
+                            encounterVisitUuid,
+                            saleOrder.getOrderId());
+                    return;
+                }
+            }
+        }
+
         // If sale order exists create sale order line and link it to sale order
         SaleOrderLine saleOrderLine = saleOrderLineHandler.buildSaleOrderLineIfProductExists(resource, saleOrder);
         if (saleOrderLine == null) {
@@ -136,6 +167,9 @@ public class SaleOrderHandler {
             return;
         }
         saleOrderLine.setSaleOrderLineCompanyId(companyId);
+        if (serviceRequestQuantity != null) {
+            saleOrderLine.setSaleOrderLineProductUomQty(serviceRequestQuantity);
+        }
 
         // Update sale order with Patient Weight if not already present
         if (saleOrder.getPartnerWeight() == null
@@ -159,6 +193,23 @@ public class SaleOrderHandler {
             String patientID,
             Integer companyId,
             ProducerTemplate producerTemplate) {
+        Float serviceRequestQuantity = null;
+        if (resource instanceof ServiceRequest serviceRequest) {
+            Product product = productHandler.getProduct(resource);
+            if (product != null) {
+                serviceRequestQuantity =
+                        getServiceRequestQuantity(serviceRequest, product, null, encounterVisitUuid, companyId);
+                if (serviceRequestQuantity != null && serviceRequestQuantity <= 0) {
+                    log.info(
+                            "ServiceRequest {}: every order of this test in visit {} is already on a confirmed sale"
+                                    + " order. No quotation created.",
+                            serviceRequest.getIdPart(),
+                            encounterVisitUuid);
+                    return;
+                }
+            }
+        }
+
         // If the sale order does not exist, create it, then create sale order line and link it to sale order
         SaleOrder newSaleOrder = saleOrderMapper.toOdoo(encounter);
         newSaleOrder.setOrderPartnerId(partner.getPartnerId());
@@ -189,6 +240,9 @@ public class SaleOrderHandler {
                 return;
             }
             saleOrderLine.setSaleOrderLineCompanyId(companyId);
+            if (serviceRequestQuantity != null) {
+                saleOrderLine.setSaleOrderLineProductUomQty(serviceRequestQuantity);
+            }
 
             producerTemplate.sendBody("direct:odoo-create-sale-order-line-route", saleOrderLine);
             log.debug(
@@ -289,6 +343,151 @@ public class SaleOrderHandler {
                     resource.getIdPart(),
                     encounterVisitUuid);
         }
+    }
+
+    /**
+     * Lowers the quantity of a lab or procedure line on the visit's draft quotation when one of several orders
+     * of that test is discontinued before it is done (UVL-EMR#360).
+     *
+     * @return true when the line was kept with the remaining orders' quantity; false when the caller should
+     *     remove the line as before: no other order of the test is left, the line is not on the draft
+     *     quotation, or the orders could not be counted
+     */
+    public boolean reduceServiceRequestLineQuantity(
+            ServiceRequest serviceRequest,
+            String encounterVisitUuid,
+            Integer companyId,
+            ProducerTemplate producerTemplate) {
+        SaleOrder saleOrder = getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid, companyId);
+        if (saleOrder == null) {
+            return false;
+        }
+        Product product = productHandler.getProduct(serviceRequest);
+        if (product == null) {
+            return false;
+        }
+        SaleOrderLine line =
+                saleOrderLineHandler.getSaleOrderLineIfExists(saleOrder.getOrderId(), product.getProductResId());
+        if (line == null) {
+            return false;
+        }
+        Float quantity =
+                getServiceRequestQuantity(serviceRequest, product, saleOrder.getOrderId(), encounterVisitUuid, companyId);
+        if (quantity == null || quantity <= 0) {
+            return false;
+        }
+        updateServiceRequestLineQuantity(serviceRequest, line, quantity, saleOrder, producerTemplate);
+        return true;
+    }
+
+    /**
+     * The quantity a lab or procedure line on the visit's quotation should carry (UVL-EMR#360): the billable
+     * orders of that test in the visit (see {@link OrderHandler#countBillableOrdersInVisit}), less what the
+     * visit's other, non-cancelled sale orders already bill for it. Without the subtraction, a repeat ordered
+     * after the first quotation was confirmed would bill the first order a second time.
+     *
+     * @param quotationId the quotation being changed, which is not subtracted; null when it is yet to be created
+     * @return the quantity, possibly 0 or less when confirmed sale orders already cover every order; or null
+     *     when the orders cannot be counted, in which case the caller keeps the one-line-per-test behaviour
+     */
+    Float getServiceRequestQuantity(
+            ServiceRequest serviceRequest,
+            Product product,
+            Integer quotationId,
+            String encounterVisitUuid,
+            Integer companyId) {
+        Integer billableOrders;
+        try {
+            billableOrders = orderHandler.countBillableOrdersInVisit(serviceRequest.getIdPart());
+        } catch (Exception e) {
+            log.warn(
+                    "ServiceRequest {}: could not count the orders of this test in visit {}, so its quantity is not"
+                            + " changed: {}",
+                    serviceRequest.getIdPart(),
+                    encounterVisitUuid,
+                    e.getMessage());
+            return null;
+        }
+        if (billableOrders == null) {
+            return null;
+        }
+
+        List<Object> criteria = new ArrayList<>();
+        criteria.add(asList("order_id.client_order_ref", "=", encounterVisitUuid));
+        criteria.add(asList("order_id.state", "!=", "cancel"));
+        criteria.add(asList("product_id", "=", product.getProductResId()));
+        if (companyId != null) {
+            criteria.add(asList("order_id.company_id", "=", companyId));
+        }
+        Object[] lines = odooClient.searchAndRead(
+                Constants.SALE_ORDER_LINE_MODEL, criteria, asList("id", "order_id", "product_uom_qty"));
+        if (lines == null) {
+            throw new EIPException(String.format(
+                    "Got null response while fetching sale order lines of product %s for visit %s",
+                    product.getProductResId(), encounterVisitUuid));
+        }
+        float billedElsewhere = 0;
+        for (Object record : lines) {
+            Map<String, Object> line = (Map<String, Object>) record;
+            Object orderId = line.get("order_id");
+            if (orderId instanceof Object[] pair && pair.length > 0) {
+                // XML-RPC returns a many2one as [id, name]
+                orderId = pair[0];
+            }
+            if (quotationId != null && quotationId.equals(orderId)) {
+                continue;
+            }
+            Object quantity = line.get("product_uom_qty");
+            if (quantity instanceof Number number) {
+                billedElsewhere += number.floatValue();
+            }
+        }
+        return billableOrders - billedElsewhere;
+    }
+
+    private void updateServiceRequestLineQuantity(
+            ServiceRequest serviceRequest,
+            SaleOrderLine line,
+            Float quantity,
+            SaleOrder saleOrder,
+            ProducerTemplate producerTemplate) {
+        if (quantity == null) {
+            log.info(
+                    "ServiceRequest {}: test already on quotation {} (line {}). Its quantity is not changed.",
+                    serviceRequest.getIdPart(),
+                    saleOrder.getOrderId(),
+                    line.getSaleOrderLineId());
+            return;
+        }
+        if (quantity <= 0) {
+            log.warn(
+                    "ServiceRequest {}: quotation {} has line {} for a test that confirmed sale orders of the same"
+                            + " visit already bill in full. The line is left as it is: check it in Odoo.",
+                    serviceRequest.getIdPart(),
+                    saleOrder.getOrderId(),
+                    line.getSaleOrderLineId());
+            return;
+        }
+        if (quantity.equals(line.getSaleOrderLineProductUomQty())) {
+            log.debug(
+                    "ServiceRequest {}: line {} already has quantity {}",
+                    serviceRequest.getIdPart(),
+                    line.getSaleOrderLineId(),
+                    quantity);
+            return;
+        }
+        SaleOrderLine update = new SaleOrderLine();
+        update.setSaleOrderLineId(line.getSaleOrderLineId());
+        update.setSaleOrderLineProductUomQty(quantity);
+        saleOrderLineHandler.sendSaleOrderLine(producerTemplate, "direct:odoo-update-sale-order-line-route", update);
+        log.info(
+                "ServiceRequest {}: quantity of line {} on quotation {} set from {} to {}, the orders of this test"
+                        + " in the visit",
+                serviceRequest.getIdPart(),
+                line.getSaleOrderLineId(),
+                saleOrder.getOrderId(),
+                line.getSaleOrderLineProductUomQty(),
+                quantity);
     }
 
     private void removeQuotationLine(SaleOrderLine saleOrderLine, ProducerTemplate producerTemplate) {

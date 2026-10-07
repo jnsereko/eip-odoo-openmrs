@@ -173,6 +173,14 @@ public class ServiceRequestProcessor implements Processor {
                         log.info(
                                 "ServiceRequest {} was discontinued after it was fulfilled. Its sale order line is kept.",
                                 serviceRequest.getIdPart());
+                    } else if (saleOrderHandler.reduceServiceRequestLineQuantity(
+                            serviceRequest, encounterVisitUuid, companyId, producerTemplate)) {
+                        // Other orders of the same test remain in the visit: the line stays, with one less.
+                        log.info(
+                                "ServiceRequest {} was discontinued with fulfiller status {}. Its sale order line keeps"
+                                        + " the other orders of the same test.",
+                                serviceRequest.getIdPart(),
+                                fulfillerStatus);
                     } else {
                         log.info(
                                 "ServiceRequest {} was discontinued with fulfiller status {}. Removing its sale order line.",

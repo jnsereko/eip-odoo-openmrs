@@ -266,6 +266,28 @@ class ServiceRequestProcessorTest extends BaseProcessorTest {
                 .removeSaleOrderLineFromQuotation(any(ServiceRequest.class), eq(ENCOUNTER_VISIT_ID), any(), any());
     }
 
+    // UVL-EMR #360: one of two orders of the same test is discontinued; the line keeps the other one
+    @Test
+    void shouldKeepSaleOrderLineWhenAnotherOrderOfTheSameTestRemains() throws Exception {
+        // Arrange
+        Patient patient = new Patient();
+        patient.setId(PATIENT_ID);
+        Exchange exchange = createExchange(
+                discontinuedServiceRequestBundle(patient, ServiceRequest.ServiceRequestStatus.COMPLETED), "d");
+        mockPartner(patient);
+        when(orderHandler.getFulfillerStatus(SERVICE_REQUEST_ID)).thenReturn(null);
+        when(saleOrderHandler.reduceServiceRequestLineQuantity(
+                        any(ServiceRequest.class), eq(ENCOUNTER_VISIT_ID), any(), any()))
+                .thenReturn(true);
+
+        // Act
+        serviceRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, never()).removeSaleOrderLineFromQuotation(any(), any(), any(), any());
+        verify(saleOrderHandler, never()).cancelSaleOrderWhenNoSaleOrderLine(any(Integer.class), any(), any(), any());
+    }
+
     @Test
     void shouldKeepSaleOrderLineWhenDiscontinuedOrderWasFulfilled() throws Exception {
         // Arrange: the lab app discontinues an order right after its result is entered

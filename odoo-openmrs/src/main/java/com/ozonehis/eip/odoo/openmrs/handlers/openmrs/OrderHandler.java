@@ -32,6 +32,15 @@ public class OrderHandler {
 
     private static final String ORDER_RESOURCE = "order";
 
+    private static final String ACTION_DISCONTINUE = "DISCONTINUE";
+
+    // What countBillableOrdersInVisit reads of an order
+    private static final String ORDER_IN_VISIT_REP = "custom:(uuid,action,voided,dateStopped,fulfillerStatus,"
+            + "patient:(uuid),concept:(uuid),encounter:(uuid,visit:(uuid)))";
+
+    // Orders of one test for one patient; far more than a patient has
+    private static final int SEARCH_LIMIT = 100;
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Autowired
@@ -60,5 +69,63 @@ public class OrderHandler {
      */
     public boolean isFulfilled(String orderUuid) throws Exception {
         return FULFILLER_STATUS_COMPLETED.equals(getFulfillerStatus(orderUuid));
+    }
+
+    /**
+     * How many orders of the same test as the given order, in the same visit, are to be billed (UVL-EMR#360).
+     *
+     * <p>An order counts when it is not voided, is not itself a DISCONTINUE order, and is either still active
+     * or was carried out (fulfiller status COMPLETED). So a repeat of an active test counts twice, a revision
+     * counts once (the revised order is stopped unfulfilled), and an order discontinued before it was done no
+     * longer counts.
+     *
+     * <p>Every criterion is re-checked on the response rather than left to the search, because OpenMRS
+     * silently ignores search parameters it does not support.
+     *
+     * @return the count, or null when the order, its test or its visit cannot be read
+     */
+    public Integer countBillableOrdersInVisit(String orderUuid) throws Exception {
+        byte[] order = openmrsRestClient.get(ORDER_RESOURCE, orderUuid, "v=" + ORDER_IN_VISIT_REP);
+        if (order == null) {
+            log.warn("Order {} not found in OpenMRS", orderUuid);
+            return null;
+        }
+        JsonNode node = MAPPER.readTree(order);
+        String patientUuid = node.at("/patient/uuid").asText(null);
+        String conceptUuid = node.at("/concept/uuid").asText(null);
+        String visitUuid = node.at("/encounter/visit/uuid").asText(null);
+        if (patientUuid == null || conceptUuid == null || visitUuid == null) {
+            log.warn("Order {} has no patient, concept or visit, so its repeats cannot be counted", orderUuid);
+            return null;
+        }
+
+        byte[] orders = openmrsRestClient.get(
+                ORDER_RESOURCE,
+                null,
+                "patient=" + patientUuid + "&concepts=" + conceptUuid + "&limit=" + SEARCH_LIMIT + "&v="
+                        + ORDER_IN_VISIT_REP);
+        if (orders == null) {
+            return null;
+        }
+        int count = 0;
+        for (JsonNode candidate : MAPPER.readTree(orders).path("results")) {
+            if (isBillableInVisit(candidate, conceptUuid, visitUuid)) {
+                count++;
+            }
+        }
+        log.debug("Order {}: {} billable order(s) of concept {} in visit {}", orderUuid, count, conceptUuid, visitUuid);
+        return count;
+    }
+
+    private static boolean isBillableInVisit(JsonNode order, String conceptUuid, String visitUuid) {
+        if (order.path("voided").asBoolean(false)
+                || ACTION_DISCONTINUE.equals(order.path("action").asText(null))
+                || !conceptUuid.equals(order.at("/concept/uuid").asText(null))
+                || !visitUuid.equals(order.at("/encounter/visit/uuid").asText(null))) {
+            return false;
+        }
+        boolean active = order.path("dateStopped").isMissingNode()
+                || order.path("dateStopped").isNull();
+        return active || FULFILLER_STATUS_COMPLETED.equals(order.path("fulfillerStatus").asText(null));
     }
 }
