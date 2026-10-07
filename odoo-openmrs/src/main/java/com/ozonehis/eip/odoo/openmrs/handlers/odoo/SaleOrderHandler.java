@@ -70,6 +70,9 @@ public class SaleOrderHandler {
 
     public List<String> orderDefaultAttributes;
 
+    // Odoo sale order states that are still a quotation, so their lines may be changed
+    private static final List<String> QUOTATION_STATES = List.of("draft", "sent");
+
     public SaleOrder getDraftSaleOrderIfExistsByVisitId(String visitId, Integer companyId) {
         orderDefaultAttributes = asList(
                 "id",
@@ -209,6 +212,99 @@ public class SaleOrderHandler {
                             producerTemplate, "direct:odoo-delete-sale-order-line-route", saleOrderLine);
                 }
             }
+        }
+    }
+
+    /**
+     * Takes the line of an order that was cancelled before it was carried out (discontinued, or closed by
+     * the pharmacy without dispensing) off the visit's quotation, so it is not invoiced.
+     *
+     * <p>Only a quotation (state draft or sent) is changed. The line is unlinked; if Odoo refuses, its
+     * quantity is set to 0 instead. A confirmed, locked or invoiced sale order is never touched: the line is
+     * reported at WARN so that billing can correct it by hand.
+     */
+    public void removeSaleOrderLineFromQuotation(
+            Resource resource, String encounterVisitUuid, Integer companyId, ProducerTemplate producerTemplate) {
+        Product product = productHandler.getProduct(resource);
+        if (product == null) {
+            log.info(
+                    "{} {}: no Odoo product, so no sale order line to remove for visit {}",
+                    resource.fhirType(),
+                    resource.getIdPart(),
+                    encounterVisitUuid);
+            return;
+        }
+
+        List<Object> criteria = new ArrayList<>();
+        criteria.add(asList("client_order_ref", "=", encounterVisitUuid));
+        criteria.add(asList("state", "!=", "cancel"));
+        if (companyId != null) {
+            criteria.add(asList("company_id", "=", companyId));
+        }
+        Object[] records =
+                odooClient.searchAndRead(Constants.SALE_ORDER_MODEL, criteria, asList("id", "name", "state"));
+        if (records == null) {
+            throw new EIPException(String.format(
+                    "Got null response while fetching for Sale order with client_order_ref %s", encounterVisitUuid));
+        }
+
+        boolean found = false;
+        for (Object record : records) {
+            Map<String, Object> saleOrder = (Map<String, Object>) record;
+            int saleOrderId = (Integer) saleOrder.get("id");
+            String state = String.valueOf(saleOrder.get("state"));
+            SaleOrderLine saleOrderLine =
+                    saleOrderLineHandler.getSaleOrderLineIfExists(saleOrderId, product.getProductResId());
+            if (saleOrderLine == null) {
+                continue;
+            }
+            found = true;
+            if (QUOTATION_STATES.contains(state)) {
+                removeQuotationLine(saleOrderLine, producerTemplate);
+                log.info(
+                        "{} {}: removed sale order line {} from quotation {} ({}) of visit {}",
+                        resource.fhirType(),
+                        resource.getIdPart(),
+                        saleOrderLine.getSaleOrderLineId(),
+                        saleOrder.get("name"),
+                        state,
+                        encounterVisitUuid);
+            } else {
+                log.warn(
+                        "{} {} was cancelled without being carried out, but its line {} is on sale order {} in"
+                                + " state {} for visit {}. Confirmed sale orders are not changed: correct the"
+                                + " invoice in Odoo.",
+                        resource.fhirType(),
+                        resource.getIdPart(),
+                        saleOrderLine.getSaleOrderLineId(),
+                        saleOrder.get("name"),
+                        state,
+                        encounterVisitUuid);
+            }
+        }
+        if (!found) {
+            log.info(
+                    "{} {}: no sale order line to remove for visit {}",
+                    resource.fhirType(),
+                    resource.getIdPart(),
+                    encounterVisitUuid);
+        }
+    }
+
+    private void removeQuotationLine(SaleOrderLine saleOrderLine, ProducerTemplate producerTemplate) {
+        try {
+            saleOrderLineHandler.sendSaleOrderLine(
+                    producerTemplate, "direct:odoo-delete-sale-order-line-route", saleOrderLine);
+        } catch (Exception e) {
+            log.warn(
+                    "Could not delete sale order line {}, setting its quantity to 0 instead: {}",
+                    saleOrderLine.getSaleOrderLineId(),
+                    e.getMessage());
+            SaleOrderLine zeroQuantity = new SaleOrderLine();
+            zeroQuantity.setSaleOrderLineId(saleOrderLine.getSaleOrderLineId());
+            zeroQuantity.setSaleOrderLineProductUomQty(0f);
+            saleOrderLineHandler.sendSaleOrderLine(
+                    producerTemplate, "direct:odoo-update-sale-order-line-route", zeroQuantity);
         }
     }
 

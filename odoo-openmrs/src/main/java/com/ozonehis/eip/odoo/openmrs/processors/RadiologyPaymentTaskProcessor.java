@@ -16,8 +16,11 @@ import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.EncounterHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.TaskHandler;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.camel.Exchange;
@@ -114,6 +117,17 @@ public class RadiologyPaymentTaskProcessor implements Processor {
     // worth returns a handful.
     private static final int LOOKBACK_DAYS = 7;
 
+    // The visit each watched order belongs to. An order never moves to another visit, so it is
+    // resolved once rather than on every poll: an unpaid order used to cost one Encounter read every
+    // ~32 s (30 s poll delay plus the poll itself) for up to seven days, which is the repeated
+    // "Encounter/<uuid>" lookup reported in UVL-EMR#316. Only orders still being watched are kept.
+    private final Map<String, String> visitUuidByServiceRequest = new ConcurrentHashMap<>();
+
+    // Orders that ended the previous poll still waiting for payment, with when they were first seen
+    // waiting. Kept so that the poll reports a change in what it waits for, and warns when an order
+    // drops out of the look-back window unpaid, instead of re-checking the same orders in silence.
+    private Map<String, Instant> awaitingPayment = new LinkedHashMap<>();
+
     @Override
     public void process(Exchange exchange) {
         // Bounded by _lastUpdated. The unfiltered search this replaces asked OpenMRS for EVERY
@@ -139,31 +153,35 @@ public class RadiologyPaymentTaskProcessor implements Processor {
                 .execute();
 
         if (bundle == null) {
-            log.info("DEBUG: bundle is null");
+            log.debug("ServiceRequest search returned no bundle");
             return;
         }
-        log.info("DEBUG: bundle entries = {}", bundle.getEntry().size());
+        log.debug("ServiceRequest search returned {} entries", bundle.getEntry().size());
 
+        Set<String> inWindow = new HashSet<>();
+        Map<String, Instant> stillAwaiting = new LinkedHashMap<>();
         for (Bundle.BundleEntryComponent entry : bundle.getEntry()) {
             if (!(entry.getResource() instanceof ServiceRequest)) {
                 continue;
             }
             ServiceRequest serviceRequest = (ServiceRequest) entry.getResource();
             String serviceRequestId = serviceRequest.getIdElement().getIdPart();
-            log.info("DEBUG: SR {} status={}", serviceRequestId, serviceRequest.getStatus());
+            inWindow.add(serviceRequestId);
+            log.debug("ServiceRequest {} status={}", serviceRequestId, serviceRequest.getStatus());
 
             if (serviceRequest.getStatus() != ServiceRequest.ServiceRequestStatus.ACTIVE) {
                 continue;
             }
 
-            log.info("DEBUG: SR {} isRadiologyOrder={}", serviceRequestId, isRadiologyOrder(serviceRequest));
             if (!isRadiologyOrder(serviceRequest)) {
                 continue;
             }
 
             Task existingTask = taskHandler.getTaskByServiceRequestId(serviceRequestId);
-            log.info("DEBUG: SR {} existingTask status={}", serviceRequestId,
-                    existingTask == null ? "null" : existingTask.getStatus());
+            log.debug(
+                    "ServiceRequest {} existing Task status={}",
+                    serviceRequestId,
+                    existingTask == null ? "none" : existingTask.getStatus());
             if (existingTask != null
                     && (existingTask.getStatus() == Task.TaskStatus.ACCEPTED
                             || existingTask.getStatus() == Task.TaskStatus.REJECTED)) {
@@ -193,8 +211,62 @@ public class RadiologyPaymentTaskProcessor implements Processor {
             // looser patient-wide match rather than refusing to gate at all.
             String visitUuid = resolveVisitUuid(serviceRequest);
 
-            processOrderStateCheck(patientUuid, visitUuid, procedureDesc, authoredOn, existingTask);
+            OdooOrderState state =
+                    processOrderStateCheck(patientUuid, visitUuid, procedureDesc, authoredOn, existingTask);
+            if (state == OdooOrderState.PENDING) {
+                stillAwaiting.put(serviceRequestId, awaitingPayment.getOrDefault(serviceRequestId, Instant.now()));
+            }
         }
+
+        reportAwaitingPayment(stillAwaiting, inWindow);
+    }
+
+    /** The orders the last poll left waiting for payment. */
+    Set<String> getAwaitingPayment() {
+        return awaitingPayment.keySet();
+    }
+
+    /**
+     * Says what the poll is waiting for, and only when that changes.
+     *
+     * <p>An unpaid radiology order is re-checked on every poll until its line is paid, its sale order is
+     * cancelled, the order stops being active, or it leaves the {@value #LOOKBACK_DAYS}-day window. That
+     * is by design, but it used to be invisible: the only trace was the same Encounter lookup every ~32 s
+     * (UVL-EMR#316). An order that leaves the window unpaid is never re-examined, so a payment made after
+     * that will not accept its Task; that case is a WARN.
+     */
+    void reportAwaitingPayment(Map<String, Instant> stillAwaiting, Set<String> inWindow) {
+        for (Map.Entry<String, Instant> previous : awaitingPayment.entrySet()) {
+            String serviceRequestId = previous.getKey();
+            if (stillAwaiting.containsKey(serviceRequestId)) {
+                continue;
+            }
+            if (!inWindow.contains(serviceRequestId)) {
+                log.warn(
+                        "Radiology order {} is no longer watched: it was not paid within the {}-day window (waiting"
+                                + " since {}). Its Task stays requested, so a later payment will not release the exam"
+                                + " to the worklist.",
+                        serviceRequestId,
+                        LOOKBACK_DAYS,
+                        previous.getValue());
+            } else {
+                log.info("Radiology order {} is no longer awaiting payment", serviceRequestId);
+            }
+        }
+        for (String serviceRequestId : stillAwaiting.keySet()) {
+            if (!awaitingPayment.containsKey(serviceRequestId)) {
+                log.info(
+                        "Radiology order {} awaits payment in Odoo. It is re-checked on every poll until it is paid,"
+                                + " its sale order is cancelled, or it is {} days old.",
+                        serviceRequestId,
+                        LOOKBACK_DAYS);
+            }
+        }
+        if (!stillAwaiting.keySet().equals(awaitingPayment.keySet())) {
+            log.info("{} radiology order(s) awaiting payment: {}", stillAwaiting.size(), stillAwaiting.keySet());
+        }
+        awaitingPayment = stillAwaiting;
+        visitUuidByServiceRequest.keySet().retainAll(stillAwaiting.keySet());
     }
 
     /**
@@ -234,6 +306,11 @@ public class RadiologyPaymentTaskProcessor implements Processor {
      * (client_order_ref), so it is the link between an order and the money paid for it.
      */
     private String resolveVisitUuid(ServiceRequest serviceRequest) {
+        String serviceRequestId = serviceRequest.getIdElement().getIdPart();
+        String cached = visitUuidByServiceRequest.get(serviceRequestId);
+        if (cached != null) {
+            return cached;
+        }
         try {
             if (serviceRequest.getEncounter() == null
                     || serviceRequest.getEncounter().getReference() == null) {
@@ -244,7 +321,9 @@ public class RadiologyPaymentTaskProcessor implements Processor {
             if (encounter == null || encounter.getPartOf() == null || encounter.getPartOf().getReference() == null) {
                 return null;
             }
-            return encounter.getPartOf().getReference().split("/")[1];
+            String visitUuid = encounter.getPartOf().getReference().split("/")[1];
+            visitUuidByServiceRequest.put(serviceRequestId, visitUuid);
+            return visitUuid;
         } catch (Exception e) {
             log.warn("Could not resolve the visit for ServiceRequest {}: {}",
                     serviceRequest.getIdElement().getIdPart(), e.getMessage());
@@ -252,7 +331,8 @@ public class RadiologyPaymentTaskProcessor implements Processor {
         }
     }
 
-    private void processOrderStateCheck(
+    /** Returns the state found, or PENDING when the check could not be completed. */
+    private OdooOrderState processOrderStateCheck(
             String patientUuid, String visitUuid, String procedureDesc, Date authoredOn, Task existingTask) {
         try {
             OdooOrderState state = checkOdooOrderState(patientUuid, visitUuid, procedureDesc, authoredOn);
@@ -268,6 +348,7 @@ public class RadiologyPaymentTaskProcessor implements Processor {
                     // Stays at requested - re-check on next poll.
                     break;
             }
+            return state;
         } catch (Exception e) {
             // A genuine check failure - treated the same as "not yet
             // confirmed" (stays at requested), since this OpenMRS version
@@ -279,6 +360,7 @@ public class RadiologyPaymentTaskProcessor implements Processor {
                     e.getMessage(),
                     e.getCause() != null ? e.getCause().getMessage() : "none",
                     e);
+            return OdooOrderState.PENDING;
         }
     }
 
@@ -320,7 +402,7 @@ public class RadiologyPaymentTaskProcessor implements Processor {
                 lineCriteria,
                 RadiologyPaymentEvidenceHandler.LINE_FIELDS);
 
-        log.info("DEBUG: lines found = {}", lines == null ? "null" : lines.length);
+        log.debug("Sale order lines found: {}", lines == null ? "null" : lines.length);
         if (lines == null || lines.length == 0) {
             log.debug("No sale order lines for patient {} - not yet confirmed", patientUuid);
             return OdooOrderState.PENDING;
@@ -380,7 +462,7 @@ public class RadiologyPaymentTaskProcessor implements Processor {
             }
         }
 
-        log.info("DEBUG: matchKey={} mostRecentLine={}", matchKey, mostRecentLine);
+        log.debug("matchKey={} mostRecentLine={}", matchKey, mostRecentLine);
         if (mostRecentLine == null) {
             log.debug("No sale order line for procedure '{}' raised on or after this order was authored "
                     + "(patient {}) - not yet confirmed", procedureDesc, patientUuid);

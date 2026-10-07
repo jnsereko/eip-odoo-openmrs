@@ -10,6 +10,7 @@ package com.ozonehis.eip.odoo.openmrs.processors;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.CompanyHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.PartnerHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.SaleOrderHandler;
+import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.MedicationDispenseHandler;
 import com.ozonehis.eip.odoo.openmrs.model.Partner;
 import com.ozonehis.eip.odoo.openmrs.model.SaleOrder;
 import java.util.List;
@@ -21,6 +22,7 @@ import org.apache.camel.Processor;
 import org.apache.camel.ProducerTemplate;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Encounter;
+import org.hl7.fhir.r4.model.Extension;
 import org.hl7.fhir.r4.model.Medication;
 import org.hl7.fhir.r4.model.MedicationRequest;
 import org.hl7.fhir.r4.model.Patient;
@@ -46,6 +48,15 @@ public class MedicationRequestProcessor implements Processor {
 
     @Autowired
     private CompanyHandler companyHandler;
+
+    @Autowired
+    private MedicationDispenseHandler medicationDispenseHandler;
+
+    // Set by the dispensing app when the pharmacist pauses (ON_HOLD) or closes (DECLINED) a prescription
+    static final String FULFILLER_STATUS_EXTENSION_URL =
+            "http://fhir.openmrs.org/ext/medicationrequest/fulfillerstatus";
+
+    private static final List<String> NOT_DISPENSED_FULFILLER_STATUSES = List.of("ON_HOLD", "DECLINED");
 
     @Override
     public void process(Exchange exchange) {
@@ -96,7 +107,24 @@ public class MedicationRequestProcessor implements Processor {
 
                 Partner partner = partnerHandler.createOrUpdatePartner(producerTemplate, patient, companyId);
                 if ("c".equals(eventType) || "u".equals(eventType)) {
-                    if (!medicationRequest.getStatus().equals(MedicationRequest.MedicationRequestStatus.CANCELLED)) {
+                    String fulfillerStatus = getFulfillerStatus(medicationRequest);
+                    if (fulfillerStatus != null
+                            && NOT_DISPENSED_FULFILLER_STATUSES.contains(fulfillerStatus)
+                            && !medicationDispenseHandler.hasDispensedQuantity(medicationRequest.getIdPart())) {
+                        // Paused or closed by the pharmacy with nothing dispensed: not billed. If the
+                        // pharmacist dispenses later, the fulfiller status changes again and the line is re-added.
+                        // A partly dispensed prescription keeps its line.
+                        log.info(
+                                "MedicationRequest {} has fulfiller status {} and nothing dispensed. Removing its sale order line.",
+                                medicationRequest.getIdPart(),
+                                fulfillerStatus);
+                        saleOrderHandler.removeSaleOrderLineFromQuotation(
+                                medicationRequest, encounterVisitUuid, companyId, producerTemplate);
+                        saleOrderHandler.cancelSaleOrderWhenNoSaleOrderLine(
+                                partner.getPartnerId(), encounterVisitUuid, companyId, producerTemplate);
+                    } else if (!medicationRequest
+                            .getStatus()
+                            .equals(MedicationRequest.MedicationRequestStatus.CANCELLED)) {
                         SaleOrder saleOrder =
                                 saleOrderHandler.getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid, companyId);
                         if (saleOrder != null) {
@@ -125,7 +153,7 @@ public class MedicationRequestProcessor implements Processor {
                     }
                 } else if ("d".equals(eventType)) {
                     // Executed when DISCONTINUE option is selected in OpenMRS
-                    saleOrderHandler.deleteSaleOrderLine(
+                    saleOrderHandler.removeSaleOrderLineFromQuotation(
                             medicationRequest, encounterVisitUuid, companyId, producerTemplate);
                     saleOrderHandler.cancelSaleOrderWhenNoSaleOrderLine(
                             partner.getPartnerId(), encounterVisitUuid, companyId, producerTemplate);
@@ -136,5 +164,13 @@ public class MedicationRequestProcessor implements Processor {
         } catch (Exception e) {
             throw new CamelExecutionException("Error processing MedicationRequest", exchange, e);
         }
+    }
+
+    private String getFulfillerStatus(MedicationRequest medicationRequest) {
+        Extension extension = medicationRequest.getExtensionByUrl(FULFILLER_STATUS_EXTENSION_URL);
+        if (extension == null || extension.getValue() == null) {
+            return null;
+        }
+        return extension.getValue().primitiveValue();
     }
 }

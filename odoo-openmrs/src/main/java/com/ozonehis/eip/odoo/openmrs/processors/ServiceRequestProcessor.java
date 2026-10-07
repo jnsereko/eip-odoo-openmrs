@@ -11,6 +11,7 @@ import com.ozonehis.eip.odoo.openmrs.handlers.odoo.CompanyHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.PartnerHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.SaleOrderHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.EncounterHandler;
+import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.OrderHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.PatientHandler;
 import com.ozonehis.eip.odoo.openmrs.model.Partner;
 import com.ozonehis.eip.odoo.openmrs.model.SaleOrder;
@@ -53,6 +54,9 @@ public class ServiceRequestProcessor implements Processor {
 
     @Autowired
     private CompanyHandler companyHandler;
+
+    @Autowired
+    private OrderHandler orderHandler;
 
     @Override
     public void process(Exchange exchange) {
@@ -116,7 +120,17 @@ public class ServiceRequestProcessor implements Processor {
                     boolean isCompletedStatus =
                             serviceRequest.getStatus().equals(ServiceRequest.ServiceRequestStatus.COMPLETED);
 
-                    if (isOrderIntent) {
+                    if (isOrderIntent
+                            && "u".equals(eventType)
+                            && isCompletedStatus
+                            && !orderHandler.isFulfilled(serviceRequest.getIdPart())) {
+                        // FHIR2 reads a ServiceRequest as COMPLETED as soon as the order is stopped, so this is
+                        // also the update of an order that was discontinued or revised before it was carried
+                        // out. Its line must not be (re)added: the DISCONTINUE event removes it.
+                        log.info(
+                                "ServiceRequest {} was stopped without being fulfilled. No sale order line added.",
+                                serviceRequest.getIdPart());
+                    } else if (isOrderIntent) {
                         SaleOrder saleOrder =
                                 saleOrderHandler.getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid, companyId);
                         if (isActiveStatus || ("u".equals(eventType) && isCompletedStatus)) {
@@ -150,16 +164,21 @@ public class ServiceRequestProcessor implements Processor {
                                 serviceRequest, encounterVisitUuid, companyId, producerTemplate);
                     }
                 } else if ("d".equals(eventType)) {
-                    // Executed when a DISCONTINUE option is selected in OpenMRS
-                    // When an Order in OpenMRS is fulfilled, the status is changed to COMPLETED. Therefore, no action
-                    // is taken.
-                    if (serviceRequest.getStatus().equals(ServiceRequest.ServiceRequestStatus.COMPLETED)) {
-                        log.debug(
-                                "ServiceRequest with id: {} has status {}. No action taken on Sale Order.",
-                                serviceRequest.getIdPart(),
-                                serviceRequest.getStatus());
+                    // Executed when a DISCONTINUE option is selected in OpenMRS, and when the lab app
+                    // discontinues an order after entering its result. The ServiceRequest status cannot tell the
+                    // two apart (FHIR2 reads every stopped order as COMPLETED), so the order's fulfiller status
+                    // decides: a fulfilled order stays billed, any other loses its line on the quotation.
+                    String fulfillerStatus = orderHandler.getFulfillerStatus(serviceRequest.getIdPart());
+                    if (OrderHandler.FULFILLER_STATUS_COMPLETED.equals(fulfillerStatus)) {
+                        log.info(
+                                "ServiceRequest {} was discontinued after it was fulfilled. Its sale order line is kept.",
+                                serviceRequest.getIdPart());
                     } else {
-                        saleOrderHandler.deleteSaleOrderLine(
+                        log.info(
+                                "ServiceRequest {} was discontinued with fulfiller status {}. Removing its sale order line.",
+                                serviceRequest.getIdPart(),
+                                fulfillerStatus);
+                        saleOrderHandler.removeSaleOrderLineFromQuotation(
                                 serviceRequest, encounterVisitUuid, companyId, producerTemplate);
                         saleOrderHandler.cancelSaleOrderWhenNoSaleOrderLine(
                                 partner.getPartnerId(), encounterVisitUuid, companyId, producerTemplate);
