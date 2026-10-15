@@ -27,6 +27,7 @@ import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.camel.ProducerTemplate;
 import org.hl7.fhir.r4.model.Encounter;
+import org.hl7.fhir.r4.model.MedicationRequest;
 import org.hl7.fhir.r4.model.Observation;
 import org.hl7.fhir.r4.model.Resource;
 import org.hl7.fhir.r4.model.ServiceRequest;
@@ -157,6 +158,12 @@ public class SaleOrderHandler {
             }
         }
 
+        if (resource instanceof MedicationRequest medicationRequest
+                && isMedicationRequestBilledElsewhere(
+                        medicationRequest, saleOrder.getOrderId(), encounterVisitUuid, companyId)) {
+            return;
+        }
+
         // If sale order exists create sale order line and link it to sale order
         SaleOrderLine saleOrderLine = saleOrderLineHandler.buildSaleOrderLineIfProductExists(resource, saleOrder);
         if (saleOrderLine == null) {
@@ -208,6 +215,11 @@ public class SaleOrderHandler {
                     return;
                 }
             }
+        }
+
+        if (resource instanceof MedicationRequest medicationRequest
+                && isMedicationRequestBilledElsewhere(medicationRequest, null, encounterVisitUuid, companyId)) {
+            return;
         }
 
         // If the sale order does not exist, create it, then create sale order line and link it to sale order
@@ -325,7 +337,8 @@ public class SaleOrderHandler {
                         encounterVisitUuid);
             } else {
                 log.warn(
-                        "{} {} was cancelled without being carried out, but its line {} is on sale order {} in"
+                        "{} {} was stopped (discontinued, paused or closed) before it was carried out, but its"
+                                + " line {} is on sale order {} in"
                                 + " state {} for visit {}. Confirmed sale orders are not changed: correct the"
                                 + " invoice in Odoo.",
                         resource.fhirType(),
@@ -371,12 +384,85 @@ public class SaleOrderHandler {
         if (line == null) {
             return false;
         }
-        Float quantity =
-                getServiceRequestQuantity(serviceRequest, product, saleOrder.getOrderId(), encounterVisitUuid, companyId);
+        Float quantity = getServiceRequestQuantity(
+                serviceRequest, product, saleOrder.getOrderId(), encounterVisitUuid, companyId);
         if (quantity == null || quantity <= 0) {
             return false;
         }
         updateServiceRequestLineQuantity(serviceRequest, line, quantity, saleOrder, producerTemplate);
+        return true;
+    }
+
+    /**
+     * Whether the visit's other, non-cancelled sale orders already bill this prescription.
+     *
+     * <p>Every dispense, pause or other update of a MedicationRequest is processed again. Once the visit's
+     * quotation is confirmed (for example the cashier takes payment for an X-ray before the pharmacy
+     * dispenses), there is no draft quotation left, so without this check the update created a new quotation
+     * holding the drug a second time. A drug line carries no link to its order, so lines are counted: when the
+     * other sale orders hold at least as many lines for this drug's product as the visit has billable orders of
+     * the drug, the prescription is billed already. A new prescription of the same drug later in the visit
+     * still gets a line.
+     *
+     * @param quotationId the quotation being changed, which is not counted; null when it is yet to be created
+     */
+    boolean isMedicationRequestBilledElsewhere(
+            MedicationRequest medicationRequest, Integer quotationId, String encounterVisitUuid, Integer companyId) {
+        Product product = productHandler.getProduct(medicationRequest);
+        if (product == null) {
+            return false;
+        }
+
+        List<Object> criteria = new ArrayList<>();
+        criteria.add(asList("order_id.client_order_ref", "=", encounterVisitUuid));
+        criteria.add(asList("order_id.state", "!=", "cancel"));
+        criteria.add(asList("product_id", "=", product.getProductResId()));
+        if (companyId != null) {
+            criteria.add(asList("order_id.company_id", "=", companyId));
+        }
+        Object[] lines = odooClient.searchAndRead(Constants.SALE_ORDER_LINE_MODEL, criteria, asList("id", "order_id"));
+        if (lines == null) {
+            throw new EIPException(String.format(
+                    "Got null response while fetching sale order lines of product %s for visit %s",
+                    product.getProductResId(), encounterVisitUuid));
+        }
+        int linesElsewhere = 0;
+        for (Object record : lines) {
+            Object orderId = ((Map<String, Object>) record).get("order_id");
+            if (orderId instanceof Object[] pair && pair.length > 0) {
+                // XML-RPC returns a many2one as [id, name]
+                orderId = pair[0];
+            }
+            if (quotationId == null || !quotationId.equals(orderId)) {
+                linesElsewhere++;
+            }
+        }
+        if (linesElsewhere == 0) {
+            return false;
+        }
+
+        Integer billableOrders;
+        try {
+            billableOrders = orderHandler.countBillableOrdersInVisit(medicationRequest.getIdPart());
+        } catch (Exception e) {
+            log.warn(
+                    "MedicationRequest {}: could not count the orders of this drug in visit {}: {}",
+                    medicationRequest.getIdPart(),
+                    encounterVisitUuid,
+                    e.getMessage());
+            billableOrders = null;
+        }
+        if (billableOrders != null && billableOrders > linesElsewhere) {
+            return false;
+        }
+        // Billing a drug twice is worse than missing a repeat, so a count that cannot be read counts as billed.
+        log.info(
+                "MedicationRequest {}: other sale orders of visit {} already hold {} line(s) for this drug ({}"
+                        + " billable order(s)). No line added.",
+                medicationRequest.getIdPart(),
+                encounterVisitUuid,
+                linesElsewhere,
+                billableOrders == null ? "unknown" : billableOrders);
         return true;
     }
 
