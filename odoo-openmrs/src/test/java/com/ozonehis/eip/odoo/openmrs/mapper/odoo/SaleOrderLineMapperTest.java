@@ -151,6 +151,20 @@ class SaleOrderLineMapperTest {
     }
 
     @Test
+    public void shouldUseConfiguredDurationUnitLabels() {
+        org.springframework.test.util.ReflectionTestUtils.setField(
+                saleOrderLineMapper, "durationUnitLabels", "d=jour|jours, wk=semaine|semaines");
+
+        assertEquals("jours", saleOrderLineMapper.durationLabel(Timing.UnitsOfTime.D, java.math.BigDecimal.valueOf(5)));
+        assertEquals("jour", saleOrderLineMapper.durationLabel(Timing.UnitsOfTime.D, java.math.BigDecimal.ONE));
+        assertEquals(
+                "semaines", saleOrderLineMapper.durationLabel(Timing.UnitsOfTime.WK, java.math.BigDecimal.valueOf(2)));
+        // a unit that is not listed keeps FHIR's display
+        assertEquals(
+                "month", saleOrderLineMapper.durationLabel(Timing.UnitsOfTime.MO, java.math.BigDecimal.valueOf(3)));
+    }
+
+    @Test
     public void shouldMapSupplyRequestToSaleOrderLine() {
         // setup
         SupplyRequest supplyRequest = new SupplyRequest();
