@@ -8,6 +8,7 @@
 package com.ozonehis.eip.odoo.openmrs.handlers.openmrs;
 
 import ca.uhn.fhir.rest.client.api.IGenericClient;
+import java.util.stream.Stream;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.hl7.fhir.r4.model.Bundle;
@@ -32,6 +33,27 @@ public class MedicationDispenseHandler {
      * silently ignores search parameters it does not support and would then return every dispense.
      */
     public boolean hasDispensedQuantity(String medicationRequestId) {
+        return getDispenses(medicationRequestId).findAny().isPresent();
+    }
+
+    /**
+     * The quantity dispensed against the given MedicationRequest in the given unit (UVL-EMR#544): the sum of its
+     * completed and in-progress MedicationDispenses whose quantity is in that unit (a concept uuid). A dispense
+     * without a unit counts as in it.
+     *
+     * @return the quantity, 0 when nothing was dispensed in that unit
+     */
+    public float getDispensedQuantity(String medicationRequestId, String unit) {
+        return (float) getDispenses(medicationRequestId)
+                .map(MedicationDispense::getQuantity)
+                .filter(quantity -> quantity.hasValue()
+                        && (unit == null || !quantity.hasCode() || unit.equals(quantity.getCode())))
+                .mapToDouble(quantity -> quantity.getValue().doubleValue())
+                .sum();
+    }
+
+    // The completed and in-progress dispenses of the MedicationRequest, the ones that actually gave out the drug
+    private Stream<MedicationDispense> getDispenses(String medicationRequestId) {
         Bundle bundle = openmrsFhirClient
                 .search()
                 .forResource(MedicationDispense.class)
@@ -44,7 +66,7 @@ public class MedicationDispenseHandler {
                 .filter(MedicationDispense.class::isInstance)
                 .map(MedicationDispense.class::cast)
                 .filter(dispense -> isAuthorizedBy(dispense, medicationRequestId))
-                .anyMatch(dispense -> dispense.getStatus() == MedicationDispense.MedicationDispenseStatus.COMPLETED
+                .filter(dispense -> dispense.getStatus() == MedicationDispense.MedicationDispenseStatus.COMPLETED
                         || dispense.getStatus() == MedicationDispense.MedicationDispenseStatus.INPROGRESS);
     }
 

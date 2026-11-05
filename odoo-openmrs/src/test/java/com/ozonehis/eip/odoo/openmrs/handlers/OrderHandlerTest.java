@@ -21,6 +21,7 @@ import static org.mockito.Mockito.when;
 import com.ozonehis.eip.odoo.openmrs.client.OpenmrsRestClient;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.OrderHandler;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -116,6 +117,59 @@ class OrderHandlerTest {
         when(openmrsRestClient.get(eq("order"), eq(ORDER_UUID), any())).thenReturn(null);
 
         assertNull(orderHandler.countBillableOrdersInVisit(ORDER_UUID));
+    }
+
+    // UVL-EMR #544: every prescription of the same drug in the visit, stopped ones included, with its quantity
+    @Test
+    void shouldReadThePrescriptionsOfTheSameDrugInTheSameVisit() throws Exception {
+        when(openmrsRestClient.get(eq("order"), eq(ORDER_UUID), any()))
+                .thenReturn(bytes(drugOrderInVisit(ORDER_UUID, "NEW", false, null, null, "drug", VISIT, "10.0")));
+        String results = "{\"results\":["
+                + String.join(
+                        ",",
+                        drugOrderInVisit(ORDER_UUID, "NEW", false, null, null, "drug", VISIT, "10.0"),
+                        drugOrderInVisit("discontinued", "NEW", false, STOPPED, "COMPLETED", "drug", VISIT, "10.0"),
+                        drugOrderInVisit("no-quantity", "NEW", false, null, "ON_HOLD", "drug", VISIT, "null"),
+                        drugOrderInVisit("discontinue", "DISCONTINUE", false, null, null, "drug", VISIT, "null"),
+                        drugOrderInVisit("voided", "NEW", true, null, null, "drug", VISIT, "10.0"),
+                        drugOrderInVisit("other-visit", "NEW", false, null, null, "drug", "other-visit", "10.0"),
+                        drugOrderInVisit("syrup", "NEW", false, null, null, "other-drug", VISIT, "100.0"))
+                + "]}";
+        when(openmrsRestClient.get(eq("order"), isNull(), any())).thenReturn(bytes(results));
+
+        List<OrderHandler.DrugOrderInVisit> drugOrders = orderHandler.getDrugOrdersInVisit(ORDER_UUID);
+
+        assertEquals(
+                List.of(
+                        new OrderHandler.DrugOrderInVisit(ORDER_UUID, true, 10f, "tablet", null),
+                        new OrderHandler.DrugOrderInVisit("discontinued", false, 10f, "tablet", "COMPLETED"),
+                        new OrderHandler.DrugOrderInVisit("no-quantity", true, null, "tablet", "ON_HOLD")),
+                drugOrders);
+        // Narrowed to the drug's concept: OpenMRS rejects the search when a result (a test order) has no drug
+        verify(openmrsRestClient)
+                .get(eq("order"), isNull(), startsWith("patient=" + PATIENT + "&concepts=" + CONCEPT + "&"));
+    }
+
+    @Test
+    void shouldNotReadThePrescriptionsWhenTheOrderHasNoDrug() throws Exception {
+        when(openmrsRestClient.get(eq("order"), eq(ORDER_UUID), any()))
+                .thenReturn(bytes(orderInVisit(ORDER_UUID, "NEW", false, null, null, CONCEPT, VISIT)));
+
+        assertNull(orderHandler.getDrugOrdersInVisit(ORDER_UUID));
+    }
+
+    private static String drugOrderInVisit(
+            String uuid,
+            String action,
+            boolean voided,
+            String dateStopped,
+            String fulfillerStatus,
+            String drug,
+            String visit,
+            String quantity) {
+        String order = orderInVisit(uuid, action, voided, dateStopped, fulfillerStatus, CONCEPT, visit);
+        return order.substring(0, order.length() - 1) + ",\"drug\":{\"uuid\":\"" + drug + "\"},\"quantity\":"
+                + quantity + ",\"quantityUnits\":{\"uuid\":\"tablet\"}}";
     }
 
     private static String orderInVisit(

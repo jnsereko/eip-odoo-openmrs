@@ -108,7 +108,11 @@ public class SaleOrderLineHandler {
         return saleOrderLine;
     }
 
-    private boolean isPerContainerUom(String uomExternalId) {
+    /**
+     * Whether the dispensing unit (an OpenMRS concept uuid) measures an amount taken from a container, so that a
+     * prescription in it bills one container.
+     */
+    public boolean isPerContainerUom(String uomExternalId) {
         if (uomExternalId == null || perContainerUoms == null || perContainerUoms.isBlank()) {
             return false;
         }

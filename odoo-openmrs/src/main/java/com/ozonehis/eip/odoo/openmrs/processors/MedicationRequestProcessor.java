@@ -113,15 +113,25 @@ public class MedicationRequestProcessor implements Processor {
                             && !medicationDispenseHandler.hasDispensedQuantity(medicationRequest.getIdPart())) {
                         // Paused or closed by the pharmacy with nothing dispensed: not billed. If the
                         // pharmacist dispenses later, the fulfiller status changes again and the line is re-added.
-                        // A partly dispensed prescription keeps its line.
-                        log.info(
-                                "MedicationRequest {} has fulfiller status {} and nothing dispensed. Removing its sale order line.",
-                                medicationRequest.getIdPart(),
-                                fulfillerStatus);
-                        saleOrderHandler.removeSaleOrderLineFromQuotation(
-                                medicationRequest, encounterVisitUuid, companyId, producerTemplate);
-                        saleOrderHandler.cancelSaleOrderWhenNoSaleOrderLine(
-                                partner.getPartnerId(), encounterVisitUuid, companyId, producerTemplate);
+                        // A partly dispensed prescription keeps its line, and so does the line of a drug that other
+                        // prescriptions of the visit still bill (UVL-EMR#544), with their quantity.
+                        if (saleOrderHandler.updateMedicationRequestLineQuantity(
+                                medicationRequest, encounterVisitUuid, companyId, producerTemplate)) {
+                            log.info(
+                                    "MedicationRequest {} has fulfiller status {} and nothing dispensed. Its sale order"
+                                            + " line keeps the other prescriptions of the drug.",
+                                    medicationRequest.getIdPart(),
+                                    fulfillerStatus);
+                        } else {
+                            log.info(
+                                    "MedicationRequest {} has fulfiller status {} and nothing dispensed. Removing its sale order line.",
+                                    medicationRequest.getIdPart(),
+                                    fulfillerStatus);
+                            saleOrderHandler.removeSaleOrderLineFromQuotation(
+                                    medicationRequest, encounterVisitUuid, companyId, producerTemplate);
+                            saleOrderHandler.cancelSaleOrderWhenNoSaleOrderLine(
+                                    partner.getPartnerId(), encounterVisitUuid, companyId, producerTemplate);
+                        }
                     } else if (!medicationRequest
                             .getStatus()
                             .equals(MedicationRequest.MedicationRequestStatus.CANCELLED)) {
@@ -146,17 +156,30 @@ public class MedicationRequestProcessor implements Processor {
                                     companyId,
                                     producerTemplate);
                         }
-                    } else {
-                        // Executed when MODIFY option is selected in OpenMRS
+                    } else if (!saleOrderHandler.updateMedicationRequestLineQuantity(
+                            medicationRequest, encounterVisitUuid, companyId, producerTemplate)) {
+                        // Executed when MODIFY or DISCONTINUE option is selected in OpenMRS (FHIR2 reads a stopped
+                        // order as CANCELLED). The line stays while what was dispensed, or another prescription of
+                        // the drug in the visit, is still to bill (UVL-EMR#544).
                         saleOrderHandler.deleteSaleOrderLine(
                                 medicationRequest, encounterVisitUuid, companyId, producerTemplate);
                     }
                 } else if ("d".equals(eventType)) {
-                    // Executed when DISCONTINUE option is selected in OpenMRS
-                    saleOrderHandler.removeSaleOrderLineFromQuotation(
-                            medicationRequest, encounterVisitUuid, companyId, producerTemplate);
-                    saleOrderHandler.cancelSaleOrderWhenNoSaleOrderLine(
-                            partner.getPartnerId(), encounterVisitUuid, companyId, producerTemplate);
+                    // Executed when DISCONTINUE option is selected in OpenMRS. What was dispensed before the
+                    // prescription was discontinued stays billed, and so do the visit's other prescriptions of the
+                    // drug (UVL-EMR#544); a prescription discontinued before anything was dispensed is not billed.
+                    if (saleOrderHandler.updateMedicationRequestLineQuantity(
+                            medicationRequest, encounterVisitUuid, companyId, producerTemplate)) {
+                        log.info(
+                                "MedicationRequest {} was discontinued. Its sale order line keeps what is dispensed or"
+                                        + " still prescribed of the drug in the visit.",
+                                medicationRequest.getIdPart());
+                    } else {
+                        saleOrderHandler.removeSaleOrderLineFromQuotation(
+                                medicationRequest, encounterVisitUuid, companyId, producerTemplate);
+                        saleOrderHandler.cancelSaleOrderWhenNoSaleOrderLine(
+                                partner.getPartnerId(), encounterVisitUuid, companyId, producerTemplate);
+                    }
                 } else {
                     throw new IllegalArgumentException("Unsupported event type: " + eventType);
                 }

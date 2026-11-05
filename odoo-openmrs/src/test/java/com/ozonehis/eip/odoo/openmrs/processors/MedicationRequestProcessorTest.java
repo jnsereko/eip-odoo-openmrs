@@ -9,6 +9,7 @@ package com.ozonehis.eip.odoo.openmrs.processors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -345,6 +346,68 @@ class MedicationRequestProcessorTest extends BaseProcessorTest {
                 .removeSaleOrderLineFromQuotation(eq(medicationRequest), eq(ENCOUNTER_VISIT_ID), any(), any());
         verify(saleOrderHandler, times(1))
                 .cancelSaleOrderWhenNoSaleOrderLine(eq(PARTNER_ID), eq(ENCOUNTER_VISIT_ID), any(), any());
+    }
+
+    // UVL-EMR #544: discontinued after it was dispensed, the prescription stays billed
+    @Test
+    void shouldKeepTheSaleOrderLineWhenADispensedPrescriptionIsDiscontinued() {
+        // Arrange
+        Patient patient = new Patient();
+        MedicationRequest medicationRequest = medicationRequestWithFulfillerStatus(null);
+        medicationRequest.setStatus(MedicationRequest.MedicationRequestStatus.COMPLETED);
+        Exchange exchange = createExchange(medicationRequestBundle(patient, medicationRequest), "d");
+        mockPartner(patient);
+        when(saleOrderHandler.updateMedicationRequestLineQuantity(
+                        eq(medicationRequest), eq(ENCOUNTER_VISIT_ID), any(), any()))
+                .thenReturn(true);
+
+        // Act
+        medicationRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, never()).removeSaleOrderLineFromQuotation(any(), any(), any(), any());
+        verify(saleOrderHandler, never()).cancelSaleOrderWhenNoSaleOrderLine(anyInt(), any(), any(), any());
+    }
+
+    // UVL-EMR #544: the stopped order's update (FHIR2 reads it as CANCELLED) no longer deletes a dispensed line
+    @Test
+    void shouldKeepTheSaleOrderLineWhenAStoppedPrescriptionStillBills() {
+        // Arrange
+        Patient patient = new Patient();
+        MedicationRequest medicationRequest = medicationRequestWithFulfillerStatus(null);
+        medicationRequest.setStatus(MedicationRequest.MedicationRequestStatus.CANCELLED);
+        Exchange exchange = createExchange(medicationRequestBundle(patient, medicationRequest), "u");
+        mockPartner(patient);
+        when(saleOrderHandler.updateMedicationRequestLineQuantity(
+                        eq(medicationRequest), eq(ENCOUNTER_VISIT_ID), any(), any()))
+                .thenReturn(true);
+
+        // Act
+        medicationRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, never()).deleteSaleOrderLine(any(), any(), any(), any());
+    }
+
+    // Closed with nothing dispensed while another prescription of the drug is still billed: the line stays
+    @Test
+    void shouldKeepTheSaleOrderLineWhenAnotherPrescriptionOfTheDrugStillBills() {
+        // Arrange
+        Patient patient = new Patient();
+        MedicationRequest medicationRequest = medicationRequestWithFulfillerStatus("DECLINED");
+        Exchange exchange = createExchange(medicationRequestBundle(patient, medicationRequest), "u");
+        mockPartner(patient);
+        when(medicationDispenseHandler.hasDispensedQuantity(MEDICATION_REQUEST_ID))
+                .thenReturn(false);
+        when(saleOrderHandler.updateMedicationRequestLineQuantity(
+                        eq(medicationRequest), eq(ENCOUNTER_VISIT_ID), any(), any()))
+                .thenReturn(true);
+
+        // Act
+        medicationRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, never()).removeSaleOrderLineFromQuotation(any(), any(), any(), any());
     }
 
     private MedicationRequest medicationRequestWithFulfillerStatus(String fulfillerStatus) {

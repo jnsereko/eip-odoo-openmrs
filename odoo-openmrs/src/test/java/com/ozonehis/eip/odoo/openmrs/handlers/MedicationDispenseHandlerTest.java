@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicReference;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.MedicationDispense;
+import org.hl7.fhir.r4.model.Quantity;
 import org.hl7.fhir.r4.model.Reference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -109,6 +110,33 @@ class MedicationDispenseHandlerTest {
                 dispense(MEDICATION_REQUEST_ID, MedicationDispense.MedicationDispenseStatus.DECLINED));
 
         assertFalse(medicationDispenseHandler.hasDispensedQuantity(MEDICATION_REQUEST_ID));
+    }
+
+    // UVL-EMR #544: what a discontinued prescription keeps on the quotation
+    @Test
+    void shouldSumTheQuantityDispensedInThePrescribedUnit() {
+        responseBundle = bundleOf(
+                dispense(MEDICATION_REQUEST_ID, MedicationDispense.MedicationDispenseStatus.COMPLETED, 6, "tablet"),
+                dispense(MEDICATION_REQUEST_ID, MedicationDispense.MedicationDispenseStatus.INPROGRESS, 4, null),
+                dispense(MEDICATION_REQUEST_ID, MedicationDispense.MedicationDispenseStatus.DECLINED, 10, "tablet"),
+                dispense(MEDICATION_REQUEST_ID, MedicationDispense.MedicationDispenseStatus.COMPLETED, 1, "box"),
+                dispense(OTHER_MEDICATION_REQUEST_ID, MedicationDispense.MedicationDispenseStatus.COMPLETED, 10, "tablet"));
+
+        assertEquals(10f, medicationDispenseHandler.getDispensedQuantity(MEDICATION_REQUEST_ID, "tablet"));
+    }
+
+    @Test
+    void shouldReportNoQuantityWhenNothingWasDispensed() {
+        responseBundle = bundleOf(dispense(MEDICATION_REQUEST_ID, MedicationDispense.MedicationDispenseStatus.ONHOLD));
+
+        assertEquals(0f, medicationDispenseHandler.getDispensedQuantity(MEDICATION_REQUEST_ID, "tablet"));
+    }
+
+    private static MedicationDispense dispense(
+            String medicationRequestId, MedicationDispense.MedicationDispenseStatus status, double quantity, String unit) {
+        MedicationDispense dispense = dispense(medicationRequestId, status);
+        dispense.setQuantity(new Quantity().setValue(quantity).setCode(unit));
+        return dispense;
     }
 
     private static MedicationDispense dispense(
