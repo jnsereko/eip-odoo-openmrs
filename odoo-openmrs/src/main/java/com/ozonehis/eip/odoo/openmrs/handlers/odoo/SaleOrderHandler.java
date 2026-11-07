@@ -859,6 +859,121 @@ public class SaleOrderHandler {
                 + observation.getValueQuantity().getUnit();
     }
 
+    /**
+     * The nights of a stay product (UVL-EMR#246) still to bill on the visit's quotation: the stay's nights less
+     * what the visit's other non-cancelled sale orders already bill of the product. Never below 0: when they bill
+     * more nights than the stay has, nothing is taken back from them and it is reported at WARN.
+     *
+     * @param quotationId the visit's quotation, which is not subtracted; null when it is yet to be created
+     */
+    public float getStayNightsToBill(
+            Product product, int nights, Integer quotationId, String visitUuid, Integer companyId) {
+        float billedElsewhere = getQuantityBilledElsewhere(product, quotationId, visitUuid, companyId);
+        float toBill = nights - billedElsewhere;
+        if (toBill < 0) {
+            log.warn(
+                    "Visit {}: confirmed sale orders bill {} night(s) of product {} but the stay counts {}. Confirmed"
+                            + " sale orders are not changed: correct the invoice in Odoo.",
+                    visitUuid,
+                    billedElsewhere,
+                    product.getProductResId(),
+                    nights);
+            return 0;
+        }
+        return toBill;
+    }
+
+    /**
+     * Sets the line of a stay product on the visit's quotation to this many nights: added, changed, or removed
+     * when 0 (UVL-EMR#246). The quantity is recounted from the stay on every run and written as is, so running
+     * it again changes nothing. Only the quotation passed in is changed; the caller passes the visit's draft
+     * quotation, never a confirmed sale order.
+     */
+    public void upsertStayLine(
+            SaleOrder quotation, Product product, float nights, Integer companyId, ProducerTemplate producerTemplate) {
+        SaleOrderLine line =
+                saleOrderLineHandler.getSaleOrderLineIfExists(quotation.getOrderId(), product.getProductResId());
+        if (nights <= 0) {
+            if (line != null) {
+                removeQuotationLine(line, producerTemplate);
+                log.info(
+                        "Visit {}: stay line {} (product {}) removed from quotation {}, no night left to bill",
+                        quotation.getOrderClientOrderRef(),
+                        line.getSaleOrderLineId(),
+                        product.getProductResId(),
+                        quotation.getOrderId());
+            }
+            return;
+        }
+        if (line == null) {
+            SaleOrderLine newLine = new SaleOrderLine();
+            newLine.setSaleOrderLineOrderId(quotation.getOrderId());
+            newLine.setSaleOrderLineProductId(product.getProductResId());
+            newLine.setSaleOrderLineProductUomQty(nights);
+            // Units, as for every ServiceRequest line
+            newLine.setSaleOrderLineProductUom(1);
+            newLine.setSaleOrderLineCompanyId(companyId);
+            producerTemplate.sendBody("direct:odoo-create-sale-order-line-route", newLine);
+            log.info(
+                    "Visit {}: stay line added to quotation {}: product {}, {} night(s)",
+                    quotation.getOrderClientOrderRef(),
+                    quotation.getOrderId(),
+                    product.getProductResId(),
+                    nights);
+            return;
+        }
+        Float current = line.getSaleOrderLineProductUomQty();
+        if (current != null && current == nights) {
+            log.debug(
+                    "Visit {}: stay line {} keeps {} night(s)",
+                    quotation.getOrderClientOrderRef(),
+                    line.getSaleOrderLineId(),
+                    nights);
+            return;
+        }
+        SaleOrderLine update = new SaleOrderLine();
+        update.setSaleOrderLineId(line.getSaleOrderLineId());
+        update.setSaleOrderLineProductUomQty(nights);
+        saleOrderLineHandler.sendSaleOrderLine(producerTemplate, "direct:odoo-update-sale-order-line-route", update);
+        log.info(
+                "Visit {}: stay line {} (product {}) set from {} to {} night(s)",
+                quotation.getOrderClientOrderRef(),
+                line.getSaleOrderLineId(),
+                product.getProductResId(),
+                current,
+                nights);
+    }
+
+    /**
+     * Creates the visit's quotation, empty, for a stay billed before anything else on the visit, in the same way
+     * {@link #createSaleOrderWithSaleOrderLine} does, and returns it as read back from Odoo.
+     *
+     * @param encounter an encounter of the visit (its partOf is the visit)
+     */
+    public SaleOrder createStayQuotation(
+            Encounter encounter,
+            Partner partner,
+            String visitUuid,
+            String patientId,
+            Integer companyId,
+            ProducerTemplate producerTemplate) {
+        SaleOrder newSaleOrder = saleOrderMapper.toOdoo(encounter);
+        newSaleOrder.setOrderPartnerId(partner.getPartnerId());
+        newSaleOrder.setOrderState("draft");
+        newSaleOrder.setCompanyId(companyId);
+        newSaleOrder.setPartnerBirthDate(partner.getPartnerBirthDate());
+        if (partner.getPartnerExternalId() != null) {
+            newSaleOrder.setOdooCustomerId(partner.getPartnerExternalId().replaceAll("(?i)</?p>", ""));
+        }
+        String patientWeight = getPartnerWeight(patientId);
+        if (patientWeight != null) {
+            newSaleOrder.setPartnerWeight(patientWeight);
+        }
+        sendSaleOrder(producerTemplate, "direct:odoo-create-sale-order-route", newSaleOrder);
+        log.info("Visit {}: quotation created for the inpatient stay", visitUuid);
+        return getDraftSaleOrderIfExistsByVisitId(visitUuid, companyId);
+    }
+
     private Object toMany2oneId(Object value) {
         if (value instanceof List<?> pair && !pair.isEmpty()) {
             return pair.get(0);
