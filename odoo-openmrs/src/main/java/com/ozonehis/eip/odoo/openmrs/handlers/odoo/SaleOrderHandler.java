@@ -143,6 +143,9 @@ public class SaleOrderHandler {
             String patientID,
             Integer companyId,
             ProducerTemplate producerTemplate) {
+        // A payer changed since the quotation was created is not applied to it, but noted on it (UVL-EMR#219).
+        insurancePayerHandler.noteVisitPayerChange(saleOrder, encounterVisitUuid);
+
         Float serviceRequestQuantity = null;
         if (resource instanceof ServiceRequest serviceRequest) {
             Product product = productHandler.getProduct(resource);
@@ -291,8 +294,8 @@ public class SaleOrderHandler {
         if (patientWeight != null) {
             newSaleOrder.setPartnerWeight(getPartnerWeight(patientID));
         }
-        // The plans that pay for the visit, from its payer. Set once, on the new quotation: a payer changed
-        // after the visit's first order is not applied to it.
+        // The plans that pay for the visit, from its payers. Set once, on the new quotation: a payer changed
+        // after the visit's first order is not applied to it, but noted on it.
         insurancePayerHandler.applyVisitPayer(newSaleOrder, encounterVisitUuid);
 
         sendSaleOrder(producerTemplate, "direct:odoo-create-sale-order-route", newSaleOrder);

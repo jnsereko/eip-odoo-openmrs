@@ -8,6 +8,7 @@
 package com.ozonehis.eip.odoo.openmrs.handlers;
 
 import static java.util.Arrays.asList;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -15,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -32,6 +34,7 @@ import java.util.Map;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.openmrs.eip.EIPException;
@@ -51,6 +54,12 @@ class InsurancePayerHandlerTest {
     private static final String CASH = "cash-answer-uuid";
 
     private static final String MOBILE_MONEY = "mobile-money-answer-uuid";
+
+    private static final String SUPPLEMENTARY_TYPE = "supplementary-attribute-type-uuid";
+
+    private static final String PNB = "pnb-answer-uuid";
+
+    private static final int QUOTATION_ID = 7;
 
     @Mock
     private OdooClient odooClient;
@@ -208,5 +217,168 @@ class InsurancePayerHandlerTest {
 
         verify(openmrsRestClient)
                 .get("visit", VISIT_UUID + "?v=custom:(uuid,attributes:(uuid,voided,attributeType:(uuid),value))");
+    }
+
+    private void givenQuotationPlans(Object base, Object complementary) {
+        when(odooClient.searchAndRead(
+                        eq(Constants.SALE_ORDER_MODEL), eq(List.of(asList("id", "=", QUOTATION_ID))), any()))
+                .thenReturn(new Object[] {
+                    Map.of("id", QUOTATION_ID, "insurance_base_id", base, "insurance_complementary_id", complementary)
+                });
+    }
+
+    private void givenNotes(Object... notes) {
+        when(odooClient.searchAndRead(eq("mail.message"), any(), any())).thenReturn(notes);
+    }
+
+    private static SaleOrder quotation() {
+        SaleOrder quotation = new SaleOrder();
+        quotation.setOrderId(QUOTATION_ID);
+        return quotation;
+    }
+
+    @Test
+    public void shouldNameThePayerAndTheSupplementaryPayersPlans() throws Exception {
+        handler.setSupplementaryAttributeTypeUuid(SUPPLEMENTARY_TYPE);
+        givenVisit(codedAttribute(PAYER_TYPE, MFP, false) + "," + codedAttribute(SUPPLEMENTARY_TYPE, PNB, false));
+        givenPlan(MFP, 41, "base");
+        givenPlan(PNB, 42, "complementary");
+        SaleOrder saleOrder = new SaleOrder();
+
+        handler.applyVisitPayer(saleOrder, VISIT_UUID);
+
+        assertEquals(41, saleOrder.getInsuranceBaseId());
+        assertEquals(42, saleOrder.getInsuranceComplementaryId());
+    }
+
+    @Test
+    public void shouldNameNoComplementaryPlanWhenTheVisitHasNoSupplementaryPayer() throws Exception {
+        handler.setSupplementaryAttributeTypeUuid(SUPPLEMENTARY_TYPE);
+        givenVisit(codedAttribute(PAYER_TYPE, MFP, false));
+        givenPlan(MFP, 41, "base");
+        SaleOrder saleOrder = new SaleOrder();
+
+        handler.applyVisitPayer(saleOrder, VISIT_UUID);
+
+        assertEquals(41, saleOrder.getInsuranceBaseId());
+        // The visit form has the field and it was left empty: not the patient's complementary plan.
+        assertEquals(Boolean.FALSE, saleOrder.getInsuranceComplementaryId());
+    }
+
+    @Test
+    public void shouldKeepTheSupplementaryPlanOfASelfPaidVisit() throws Exception {
+        handler.setSupplementaryAttributeTypeUuid(SUPPLEMENTARY_TYPE);
+        givenVisit(codedAttribute(PAYER_TYPE, CASH, false) + "," + codedAttribute(SUPPLEMENTARY_TYPE, PNB, false));
+        givenPlan(PNB, 42, "complementary");
+        SaleOrder saleOrder = new SaleOrder();
+
+        handler.applyVisitPayer(saleOrder, VISIT_UUID);
+
+        assertEquals(Boolean.FALSE, saleOrder.getInsuranceBaseId());
+        assertEquals(42, saleOrder.getInsuranceComplementaryId());
+    }
+
+    @Test
+    public void shouldFailWhenTheSupplementaryPayerHasNoPlan() throws Exception {
+        handler.setSupplementaryAttributeTypeUuid(SUPPLEMENTARY_TYPE);
+        givenVisit(codedAttribute(PAYER_TYPE, MFP, false) + "," + codedAttribute(SUPPLEMENTARY_TYPE, PNB, false));
+        givenPlan(MFP, 41, "base");
+        when(odooClient.searchAndRead(
+                        eq(Constants.PARTNER_MODEL),
+                        eq(List.of(asList("is_insurance", "=", true), asList("insurance_payer_code", "=", PNB))),
+                        any()))
+                .thenReturn(new Object[] {});
+        SaleOrder saleOrder = new SaleOrder();
+
+        EIPException e = assertThrows(EIPException.class, () -> handler.applyVisitPayer(saleOrder, VISIT_UUID));
+
+        assertTrue(e.getMessage().contains(PNB));
+        assertNull(saleOrder.getInsuranceBaseId());
+    }
+
+    @Test
+    public void shouldFailWhenTheVisitNamesTwoComplementaryPlans() throws Exception {
+        handler.setSupplementaryAttributeTypeUuid(SUPPLEMENTARY_TYPE);
+        givenVisit(codedAttribute(PAYER_TYPE, SUPPLEMENTARY, false) + ","
+                + codedAttribute(SUPPLEMENTARY_TYPE, PNB, false));
+        givenPlan(SUPPLEMENTARY, 43, "complementary");
+        givenPlan(PNB, 42, "complementary");
+
+        assertThrows(EIPException.class, () -> handler.applyVisitPayer(new SaleOrder(), VISIT_UUID));
+    }
+
+    @Test
+    public void shouldNotNoteAQuotationThatMatchesTheVisit() throws Exception {
+        givenVisit(codedAttribute(PAYER_TYPE, MFP, false));
+        givenPlan(MFP, 41, "base");
+        givenQuotationPlans(new Object[] {41, "MFP"}, false);
+
+        handler.noteVisitPayerChange(quotation(), VISIT_UUID);
+
+        verify(odooClient, never()).create(any(), any());
+    }
+
+    @Test
+    public void shouldNoteAPayerChangedAfterTheQuotationWasCreated() throws Exception {
+        givenVisit(codedAttribute(PAYER_TYPE, MFP, false));
+        givenPlan(MFP, 41, "base");
+        givenQuotationPlans(false, false);
+        givenNotes();
+        handler.setPayerChangedNote("billed to %s, visit says %s");
+
+        handler.noteVisitPayerChange(quotation(), VISIT_UUID);
+
+        ArgumentCaptor<List<Map<String, Object>>> message = ArgumentCaptor.forClass(List.class);
+        verify(odooClient).create(eq("mail.message"), message.capture());
+        Map<String, Object> note = message.getValue().get(0);
+        assertEquals(Constants.SALE_ORDER_MODEL, note.get("model"));
+        assertEquals(QUOTATION_ID, note.get("res_id"));
+        assertEquals("billed to -, visit says Plan 41", note.get("body"));
+        // The quotation's plans are not written.
+        verify(odooClient, never()).write(any(), any());
+    }
+
+    @Test
+    public void shouldNoteAChangeOnlyOnce() throws Exception {
+        givenVisit(codedAttribute(PAYER_TYPE, CASH, false));
+        givenQuotationPlans(new Object[] {41, "MFP"}, false);
+        givenNotes(Map.of("id", 99));
+
+        handler.noteVisitPayerChange(quotation(), VISIT_UUID);
+
+        verify(odooClient, never()).create(any(), any());
+    }
+
+    @Test
+    public void shouldNoteAChangedPayerWithNoPlanWithoutFailingTheOrder() throws Exception {
+        givenVisit(codedAttribute(PAYER_TYPE, MFP, false));
+        when(odooClient.searchAndRead(eq(Constants.PARTNER_MODEL), any(), any()))
+                .thenReturn(new Object[] {});
+        givenQuotationPlans(false, false);
+        givenNotes();
+
+        assertDoesNotThrow(() -> handler.noteVisitPayerChange(quotation(), VISIT_UUID));
+
+        verify(odooClient).create(eq("mail.message"), any());
+    }
+
+    @Test
+    public void shouldNeverFailTheOrderWhenTheNoteCannotBeWritten() throws Exception {
+        givenVisit(codedAttribute(PAYER_TYPE, MFP, false));
+        givenPlan(MFP, 41, "base");
+        givenQuotationPlans(false, false);
+        givenNotes();
+        doThrow(new RuntimeException("odoo down")).when(odooClient).create(any(), any());
+
+        assertDoesNotThrow(() -> handler.noteVisitPayerChange(quotation(), VISIT_UUID));
+    }
+
+    @Test
+    public void shouldNotCompareWhenTheFeatureIsOff() {
+        handler.setPayerAttributeTypeUuid("");
+
+        handler.noteVisitPayerChange(quotation(), VISIT_UUID);
+
+        verifyNoInteractions(openmrsRestClient, odooClient);
     }
 }

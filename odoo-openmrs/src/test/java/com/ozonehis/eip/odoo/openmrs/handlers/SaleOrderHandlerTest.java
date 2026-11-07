@@ -211,6 +211,7 @@ class SaleOrderHandlerTest {
                 resource, saleOrder, VISIT_ID_1, PARTNER_ID, PATIENT_ID, null, producerTemplate);
 
         // Verify
+        verify(insurancePayerHandler, times(1)).noteVisitPayerChange(saleOrder, VISIT_ID_1);
         verify(producerTemplate, times(1)).sendBody("direct:odoo-create-sale-order-line-route", saleOrderLine);
     }
 
