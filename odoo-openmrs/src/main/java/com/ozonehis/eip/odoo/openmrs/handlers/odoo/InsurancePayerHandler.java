@@ -45,8 +45,9 @@ import org.springframework.stereotype.Component;
  *       supplementary plan covers, even if they hold a plan;
  *   <li>when {@code odoo.insurance.supplementary.visit.attribute.type} is set, a visit with a payer but no
  *       supplementary payer names no complementary plan, rather than taking the patient's;
- *   <li>a payer with no plan in Odoo is an error: the quotation is not created, rather than billed to the
- *       wrong party.
+ *   <li>a payer with no plan in Odoo, two plans for one field, or a visit that cannot be read never fail
+ *       the order: the quotation names no plan (the patient pays) and gets one note saying so. Failing the
+ *       order made the bridge retry its event about once a second, forever (UVL-EMR#219, UAT 2026-11-07).
  * </ul>
  *
  * <p>The plans are set once, on the new quotation. A payer changed afterwards is not applied to it, but it is
@@ -85,6 +86,13 @@ public class InsurancePayerHandler {
     @Value("${odoo.insurance.payer.changed.note:" + DEFAULT_PAYER_CHANGED_NOTE + "}")
     private String payerChangedNote;
 
+    @Value("${odoo.insurance.payer.unplanned.note:" + DEFAULT_PAYER_UNPLANNED_NOTE + "}")
+    private String payerUnplannedNote;
+
+    static final String DEFAULT_PAYER_UNPLANNED_NOTE = "The payer of this visit (%s) has no insurance plan in"
+            + " Odoo: the quotation is billed to the patient. Correct the insurance plans of this quotation if"
+            + " needed.";
+
     static final String DEFAULT_PAYER_CHANGED_NOTE = "The payer of this visit was changed after this quotation was"
             + " created. The quotation is billed to: %s. The visit now says: %s. If the visit is right, correct the"
             + " insurance plans of this quotation; invoices already made do not change.";
@@ -101,26 +109,52 @@ public class InsurancePayerHandler {
 
     /**
      * Sets the plans of a new quotation from the payers of its visit. Does nothing when the feature is off.
+     * Never throws.
      *
-     * @throws EIPException when the visit cannot be read, or one of its payers has no plan in Odoo
+     * @return null, or what to note on the quotation once it exists ({@link #noteVisitPayerProblem}) when the
+     *     visit's payers could not be turned into plans and the quotation names none
      */
-    public void applyVisitPayer(SaleOrder saleOrder, String visitUuid) {
+    public String applyVisitPayer(SaleOrder saleOrder, String visitUuid) {
         if (!isEnabled()) {
-            return;
+            return null;
         }
-        VisitPlans plans = getVisitPlans(visitUuid);
+        VisitPlans plans = resolveVisitPlans(visitUuid);
         if (plans == null) {
             log.info("Visit {} has no payer: its quotation takes the patient's plans in Odoo", visitUuid);
-            return;
+            return null;
         }
         saleOrder.setInsuranceBaseId(plans.baseId);
         saleOrder.setInsuranceComplementaryId(plans.complementaryId);
+        if (plans.problem != null) {
+            return plans.problem;
+        }
         log.info(
                 "Visit {} is paid by {} (base plan {}, complementary plan {})",
                 visitUuid,
                 plans,
                 plans.baseId,
                 plans.complementaryId);
+        return null;
+    }
+
+    /**
+     * Leaves one note on a quotation whose visit's payers have no usable plan, saying that it is billed to the
+     * patient. Once per payer: later orders of the visit do not repeat it. Never throws.
+     */
+    public void noteVisitPayerProblem(SaleOrder quotation, String problem) {
+        if (problem == null || quotation == null || quotation.getOrderId() == null) {
+            return;
+        }
+        try {
+            if (isAlreadyNoted(quotation.getOrderId(), problem)) {
+                return;
+            }
+            postNote(quotation.getOrderId(), String.format(orDefault(payerUnplannedNote, DEFAULT_PAYER_UNPLANNED_NOTE),
+                    problem));
+        } catch (RuntimeException e) {
+            log.error("Could not note on quotation {} that its payer {} has no plan", quotation.getOrderId(), problem,
+                    e);
+        }
     }
 
     /**
@@ -133,36 +167,28 @@ public class InsurancePayerHandler {
         if (!isEnabled() || quotation == null || quotation.getOrderId() == null) {
             return;
         }
+        VisitPlans plans = resolveVisitPlans(visitUuid);
+        if (plans == null) {
+            return;
+        }
+        if (plans.problem != null) {
+            // The quotation's plans are kept; the cashier is told the visit's payer has none.
+            noteVisitPayerProblem(quotation, plans.problem);
+            return;
+        }
         try {
-            String visitSide;
-            try {
-                VisitPlans plans = getVisitPlans(visitUuid);
-                if (plans == null) {
-                    return;
-                }
-                Map<String, Object> current = readQuotationPlans(quotation.getOrderId());
-                if (plans.matches(current)) {
-                    return;
-                }
-                visitSide = plans.toString();
-            } catch (EIPException e) {
-                visitSide = e.getMessage();
+            Map<String, Object> current = readQuotationPlans(quotation.getOrderId());
+            if (plans.matches(current)) {
+                return;
             }
-            String quotationSide = describeQuotationPlans(readQuotationPlans(quotation.getOrderId()));
+            String visitSide = plans.toString();
+            String quotationSide = describeQuotationPlans(current);
             if (isAlreadyNoted(quotation.getOrderId(), visitSide)) {
                 return;
             }
-            // An empty setting (a compose variable passed through unset) keeps the default text.
-            String template = payerChangedNote == null || payerChangedNote.isBlank()
-                    ? DEFAULT_PAYER_CHANGED_NOTE
-                    : payerChangedNote;
-            String note = String.format(template, quotationSide, visitSide);
-            Map<String, Object> message = new HashMap<>();
-            message.put("model", Constants.SALE_ORDER_MODEL);
-            message.put("res_id", quotation.getOrderId());
-            message.put("message_type", "comment");
-            message.put("body", note);
-            odooClient.create(MESSAGE_MODEL, List.of(message));
+            postNote(
+                    quotation.getOrderId(),
+                    String.format(orDefault(payerChangedNote, DEFAULT_PAYER_CHANGED_NOTE), quotationSide, visitSide));
             log.warn(
                     "Visit {}: payer changed after quotation {} was created. Quotation billed to {}, visit now says"
                             + " {}. Noted on the quotation; its plans are unchanged.",
@@ -186,10 +212,36 @@ public class InsurancePayerHandler {
     }
 
     /**
+     * {@link #getVisitPlans}, but never throws: when the payers cannot be turned into plans, the visit names no
+     * plan at all (the patient pays) and {@link VisitPlans#problem} says which payer, for the note.
+     */
+    VisitPlans resolveVisitPlans(String visitUuid) {
+        String[] payerNames = new String[1];
+        try {
+            return getVisitPlans(visitUuid, payerNames);
+        } catch (RuntimeException e) {
+            VisitPlans patientPays = new VisitPlans();
+            patientPays.baseId = Boolean.FALSE;
+            patientPays.complementaryId = Boolean.FALSE;
+            patientPays.problem = payerNames[0] != null ? payerNames[0] : visitUuid;
+            log.warn(
+                    "Visit {}: its payer {} gives no usable insurance plan, so the quotation is billed to the patient."
+                            + " {}",
+                    visitUuid,
+                    patientPays.problem,
+                    e.getMessage());
+            return patientPays;
+        }
+    }
+
+    /**
      * The plans the visit's payers name, or null when the visit names no payer at all. A field left null is left
      * to Odoo; Boolean.FALSE names no plan.
+     *
+     * @param payerNames receives, in its first element, the names of the visit's payers once read
+     * @throws EIPException when the visit cannot be read, a payer has no plan, or two plans claim one field
      */
-    VisitPlans getVisitPlans(String visitUuid) {
+    VisitPlans getVisitPlans(String visitUuid, String[] payerNames) {
         JsonNode attributes = readVisitAttributes(visitUuid);
         String payer = getAttributeValue(attributes, payerAttributeTypeUuid);
         boolean supplementaryOn = supplementaryAttributeTypeUuid != null && !supplementaryAttributeTypeUuid.isBlank();
@@ -197,6 +249,10 @@ public class InsurancePayerHandler {
         if (payer == null && supplementary == null) {
             return null;
         }
+        String payerName = getAttributeDisplay(attributes, payerAttributeTypeUuid, payer);
+        String supplementaryName =
+                supplementaryOn ? getAttributeDisplay(attributes, supplementaryAttributeTypeUuid, supplementary) : null;
+        payerNames[0] = describe(payerName, supplementaryName);
 
         VisitPlans plans = new VisitPlans();
         if (payer != null) {
@@ -218,6 +274,39 @@ public class InsurancePayerHandler {
             plans.complementaryId = Boolean.FALSE;
         }
         return plans;
+    }
+
+    private static String orDefault(String template, String defaultTemplate) {
+        // An empty setting (a compose variable passed through unset) keeps the default text.
+        return template == null || template.isBlank() ? defaultTemplate : template;
+    }
+
+    private void postNote(Integer orderId, String note) {
+        Map<String, Object> message = new HashMap<>();
+        message.put("model", Constants.SALE_ORDER_MODEL);
+        message.put("res_id", orderId);
+        message.put("message_type", "comment");
+        message.put("body", note);
+        odooClient.create(MESSAGE_MODEL, List.of(message));
+    }
+
+    /** The answer's display name, or its uuid; null when the visit has no such attribute. */
+    private static String getAttributeDisplay(JsonNode attributes, String attributeTypeUuid, String answer) {
+        if (answer == null) {
+            return null;
+        }
+        for (JsonNode attribute : attributes) {
+            if (!attribute.path("voided").asBoolean(false)
+                    && attributeTypeUuid.equals(
+                            attribute.path("attributeType").path("uuid").asText())
+                    && attribute.path("value").isObject()) {
+                String display = attribute.path("value").path("display").asText(null);
+                if (display != null && !display.isBlank()) {
+                    return display;
+                }
+            }
+        }
+        return answer;
     }
 
     private JsonNode readVisitAttributes(String visitUuid) {
@@ -362,6 +451,9 @@ public class InsurancePayerHandler {
         Object complementaryId;
 
         String complementaryName;
+
+        /** Which payer gave no usable plan, for the note; null when the plans are fine. */
+        String problem;
 
         /** Names {@code plan} in the field its type calls for; a null plan is a self-paid payer. */
         void place(String visitUuid, String payer, Map<String, Object> plan) {
