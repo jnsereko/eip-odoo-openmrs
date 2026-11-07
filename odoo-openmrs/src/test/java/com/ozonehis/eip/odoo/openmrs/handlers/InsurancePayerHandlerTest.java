@@ -11,7 +11,6 @@ import static java.util.Arrays.asList;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -37,7 +36,6 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
-import org.openmrs.eip.EIPException;
 
 class InsurancePayerHandlerTest {
 
@@ -173,33 +171,104 @@ class InsurancePayerHandlerTest {
         assertEquals(Boolean.FALSE, saleOrder.getInsuranceBaseId());
     }
 
+    private static String namedAttribute(String type, String answer, String display) {
+        return "{\"uuid\":\"a-" + answer + "\",\"voided\":false,\"attributeType\":{\"uuid\":\"" + type
+                + "\"},\"value\":{\"uuid\":\"" + answer + "\",\"display\":\"" + display + "\"}}";
+    }
+
+    private static void assertPatientPays(SaleOrder saleOrder) {
+        assertEquals(Boolean.FALSE, saleOrder.getInsuranceBaseId());
+        assertEquals(Boolean.FALSE, saleOrder.getInsuranceComplementaryId());
+    }
+
     @Test
-    public void shouldFailWhenThePayerHasNoPlan() throws Exception {
-        givenVisit(codedAttribute(PAYER_TYPE, MFP, false));
+    public void shouldBillThePatientWhenThePayerHasNoPlan() throws Exception {
+        givenVisit(namedAttribute(PAYER_TYPE, MFP, "Assurance privée"));
         when(odooClient.searchAndRead(eq(Constants.PARTNER_MODEL), any(), any()))
                 .thenReturn(new Object[] {});
         SaleOrder saleOrder = new SaleOrder();
 
-        EIPException e = assertThrows(EIPException.class, () -> handler.applyVisitPayer(saleOrder, VISIT_UUID));
+        String problem = assertDoesNotThrow(() -> handler.applyVisitPayer(saleOrder, VISIT_UUID));
 
-        assertTrue(e.getMessage().contains(MFP));
-        assertNull(saleOrder.getInsuranceBaseId());
+        assertEquals("Assurance privée", problem);
+        assertPatientPays(saleOrder);
     }
 
     @Test
-    public void shouldFailWhenSeveralPlansHaveThePayerCode() throws Exception {
+    public void shouldBillThePatientWhenSeveralPlansHaveThePayerCode() throws Exception {
         givenVisit(codedAttribute(PAYER_TYPE, MFP, false));
         when(odooClient.searchAndRead(eq(Constants.PARTNER_MODEL), any(), any()))
                 .thenReturn(new Object[] {Map.of("id", 1), Map.of("id", 2)});
+        SaleOrder saleOrder = new SaleOrder();
 
-        assertThrows(EIPException.class, () -> handler.applyVisitPayer(new SaleOrder(), VISIT_UUID));
+        String problem = assertDoesNotThrow(() -> handler.applyVisitPayer(saleOrder, VISIT_UUID));
+
+        assertEquals("x", problem);
+        assertPatientPays(saleOrder);
     }
 
     @Test
-    public void shouldFailWhenTheVisitIsNotFound() throws Exception {
+    public void shouldBillThePatientWhenTheVisitIsNotFound() throws Exception {
         when(openmrsRestClient.get(eq("visit"), anyString())).thenReturn(null);
+        SaleOrder saleOrder = new SaleOrder();
 
-        assertThrows(EIPException.class, () -> handler.applyVisitPayer(new SaleOrder(), VISIT_UUID));
+        String problem = assertDoesNotThrow(() -> handler.applyVisitPayer(saleOrder, VISIT_UUID));
+
+        assertEquals(VISIT_UUID, problem);
+        assertPatientPays(saleOrder);
+    }
+
+    @Test
+    public void shouldBillThePatientWhenOdooCannotBeAsked() throws Exception {
+        givenVisit(codedAttribute(PAYER_TYPE, MFP, false));
+        when(odooClient.searchAndRead(eq(Constants.PARTNER_MODEL), any(), any()))
+                .thenThrow(new RuntimeException("odoo down"));
+        SaleOrder saleOrder = new SaleOrder();
+
+        assertDoesNotThrow(() -> handler.applyVisitPayer(saleOrder, VISIT_UUID));
+
+        assertPatientPays(saleOrder);
+    }
+
+    @Test
+    public void shouldNoteAPayerWithNoPlanOnTheQuotation() {
+        givenNotes();
+        handler.setPayerUnplannedNote("payeur %s sans plan");
+
+        handler.noteVisitPayerProblem(quotation(), "Assurance privée");
+
+        ArgumentCaptor<List<Map<String, Object>>> message = ArgumentCaptor.forClass(List.class);
+        verify(odooClient).create(eq("mail.message"), message.capture());
+        assertEquals("payeur Assurance privée sans plan", message.getValue().get(0).get("body"));
+        assertEquals(QUOTATION_ID, message.getValue().get(0).get("res_id"));
+    }
+
+    @Test
+    public void shouldNoteAPayerWithNoPlanOnlyOnce() {
+        givenNotes(Map.of("id", 99));
+
+        handler.noteVisitPayerProblem(quotation(), "Assurance privée");
+
+        verify(odooClient, never()).create(any(), any());
+    }
+
+    @Test
+    public void shouldNeverFailTheOrderWhenTheProblemNoteCannotBeWritten() {
+        when(odooClient.searchAndRead(eq("mail.message"), any(), any())).thenThrow(new RuntimeException("down"));
+
+        assertDoesNotThrow(() -> handler.noteVisitPayerProblem(quotation(), "Assurance privée"));
+    }
+
+    @Test
+    public void shouldWriteTheProblemNoteInTheDefaultTextWhenTheSettingIsEmpty() {
+        givenNotes();
+        handler.setPayerUnplannedNote("");
+
+        handler.noteVisitPayerProblem(quotation(), "Assurance privée");
+
+        ArgumentCaptor<List<Map<String, Object>>> message = ArgumentCaptor.forClass(List.class);
+        verify(odooClient).create(eq("mail.message"), message.capture());
+        assertTrue(String.valueOf(message.getValue().get(0).get("body")).contains("(Assurance privée)"));
     }
 
     @Test
@@ -279,7 +348,7 @@ class InsurancePayerHandlerTest {
     }
 
     @Test
-    public void shouldFailWhenTheSupplementaryPayerHasNoPlan() throws Exception {
+    public void shouldBillThePatientWhenTheSupplementaryPayerHasNoPlan() throws Exception {
         handler.setSupplementaryAttributeTypeUuid(SUPPLEMENTARY_TYPE);
         givenVisit(codedAttribute(PAYER_TYPE, MFP, false) + "," + codedAttribute(SUPPLEMENTARY_TYPE, PNB, false));
         givenPlan(MFP, 41, "base");
@@ -290,21 +359,24 @@ class InsurancePayerHandlerTest {
                 .thenReturn(new Object[] {});
         SaleOrder saleOrder = new SaleOrder();
 
-        EIPException e = assertThrows(EIPException.class, () -> handler.applyVisitPayer(saleOrder, VISIT_UUID));
+        String problem = assertDoesNotThrow(() -> handler.applyVisitPayer(saleOrder, VISIT_UUID));
 
-        assertTrue(e.getMessage().contains(PNB));
-        assertNull(saleOrder.getInsuranceBaseId());
+        assertEquals("x + x", problem);
+        assertPatientPays(saleOrder);
     }
 
     @Test
-    public void shouldFailWhenTheVisitNamesTwoComplementaryPlans() throws Exception {
+    public void shouldBillThePatientWhenTheVisitNamesTwoComplementaryPlans() throws Exception {
         handler.setSupplementaryAttributeTypeUuid(SUPPLEMENTARY_TYPE);
         givenVisit(codedAttribute(PAYER_TYPE, SUPPLEMENTARY, false) + ","
                 + codedAttribute(SUPPLEMENTARY_TYPE, PNB, false));
         givenPlan(SUPPLEMENTARY, 43, "complementary");
         givenPlan(PNB, 42, "complementary");
+        SaleOrder saleOrder = new SaleOrder();
 
-        assertThrows(EIPException.class, () -> handler.applyVisitPayer(new SaleOrder(), VISIT_UUID));
+        assertDoesNotThrow(() -> handler.applyVisitPayer(saleOrder, VISIT_UUID));
+
+        assertPatientPays(saleOrder);
     }
 
     @Test
@@ -357,9 +429,13 @@ class InsurancePayerHandlerTest {
         givenQuotationPlans(false, false);
         givenNotes();
 
+        handler.setPayerUnplannedNote("payeur %s sans plan");
+
         assertDoesNotThrow(() -> handler.noteVisitPayerChange(quotation(), VISIT_UUID));
 
-        verify(odooClient).create(eq("mail.message"), any());
+        ArgumentCaptor<List<Map<String, Object>>> message = ArgumentCaptor.forClass(List.class);
+        verify(odooClient).create(eq("mail.message"), message.capture());
+        assertEquals("payeur x sans plan", message.getValue().get(0).get("body"));
     }
 
     @Test

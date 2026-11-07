@@ -255,15 +255,25 @@ class SaleOrderHandlerTest {
     }
 
     @Test
-    public void shouldNotCreateSaleOrderWhenTheVisitsPayerHasNoPlan() {
+    public void shouldCreateTheQuotationAndNoteItWhenTheVisitsPayerHasNoPlan() {
         // Setup
+        SaleOrderLine saleOrderLine = new SaleOrderLine();
         Encounter encounter = new Encounter();
         SaleOrder saleOrder = getSaleOrder();
         Resource resource = new MedicationRequest();
+        Map<String, Object> saleOrderMap = getSaleOrderMap(1, VISIT_ID_1, "draft", 12);
         when(saleOrderMapper.toOdoo(encounter)).thenReturn(saleOrder);
+        when(odooClient.searchAndRead(
+                        eq(Constants.SALE_ORDER_MODEL),
+                        eq(List.of(asList("client_order_ref", "=", VISIT_ID_1), asList("state", "=", "draft"))),
+                        any()))
+                .thenReturn(new Object[] {saleOrderMap});
+        when(saleOrderLineHandler.buildSaleOrderLineIfProductExists(any(), any()))
+                .thenReturn(saleOrderLine);
         when(observationHandler.getObservationBySubjectIDAndConceptID(eq(PATIENT_ID), any()))
                 .thenReturn(null);
-        doThrow(new EIPException("no plan")).when(insurancePayerHandler).applyVisitPayer(saleOrder, VISIT_ID_1);
+        // The handler leaves the quotation without a plan and reports which payer had none.
+        when(insurancePayerHandler.applyVisitPayer(saleOrder, VISIT_ID_1)).thenReturn("Assurance privée");
         ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
 
         Partner partner = new Partner();
@@ -271,13 +281,17 @@ class SaleOrderHandlerTest {
         partner.setPartnerExternalId(PATIENT_IDENTIFIER);
 
         // Act
-        assertThrows(
-                EIPException.class,
-                () -> saleOrderHandler.createSaleOrderWithSaleOrderLine(
-                        resource, encounter, partner, VISIT_ID_1, PATIENT_ID, null, producerTemplate));
+        saleOrderHandler.createSaleOrderWithSaleOrderLine(
+                resource, encounter, partner, VISIT_ID_1, PATIENT_ID, null, producerTemplate);
 
-        // Verify
-        verify(producerTemplate, never()).sendBodyAndHeaders(eq("direct:odoo-create-sale-order-route"), any(), any());
+        // Verify: the order is billed, not retried, and the quotation gets the note.
+        verify(producerTemplate, times(1))
+                .sendBodyAndHeaders("direct:odoo-create-sale-order-route", saleOrder, new HashMap<>());
+        verify(producerTemplate, times(1)).sendBody("direct:odoo-create-sale-order-line-route", saleOrderLine);
+        verify(insurancePayerHandler, times(1))
+                .noteVisitPayerProblem(
+                        Mockito.argThat(order -> order != null && Integer.valueOf(1).equals(order.getOrderId())),
+                        eq("Assurance privée"));
     }
 
     @Test

@@ -296,7 +296,8 @@ public class SaleOrderHandler {
         }
         // The plans that pay for the visit, from its payers. Set once, on the new quotation: a payer changed
         // after the visit's first order is not applied to it, but noted on it.
-        insurancePayerHandler.applyVisitPayer(newSaleOrder, encounterVisitUuid);
+        // Never throws: a payer with no plan bills the patient and is noted on the quotation below.
+        String payerProblem = insurancePayerHandler.applyVisitPayer(newSaleOrder, encounterVisitUuid);
 
         sendSaleOrder(producerTemplate, "direct:odoo-create-sale-order-route", newSaleOrder);
         log.debug(
@@ -304,6 +305,7 @@ public class SaleOrderHandler {
 
         SaleOrder fetchedSaleOrder = getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid, companyId);
         if (fetchedSaleOrder != null) {
+            insurancePayerHandler.noteVisitPayerProblem(fetchedSaleOrder, payerProblem);
             SaleOrderLine saleOrderLine =
                     saleOrderLineHandler.buildSaleOrderLineIfProductExists(resource, fetchedSaleOrder);
             if (saleOrderLine == null) {
