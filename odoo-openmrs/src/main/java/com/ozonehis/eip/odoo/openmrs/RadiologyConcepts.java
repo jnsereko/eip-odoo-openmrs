@@ -68,7 +68,32 @@ public class RadiologyConcepts {
             "d0b5d4a0-1007-0000-0000-000000000001",
             "d0b5d4a0-1008-0000-0000-000000000001",
             "8155e2e0-5b62-42bc-b47c-0702aaafe3df", // EC01 - Abdominal ultrasound
-            "521361cf-ce7d-49a6-9721-8ebad1b76702"))); // EC02 - Gastrointestinal ultrasound
+            "521361cf-ce7d-49a6-9721-8ebad1b76702", // EC02 - Gastrointestinal ultrasound
+            // The 22 body-part X-rays of M3 (UVL-EMR#212, #340), the same list the Orthanc bridge
+            // carries: without them a paid ankle X-ray got no payment Task and never reached the
+            // worklist (production, 2026-10-27).
+            "dac7eb20-d3af-4097-a399-2b1a9f3e0ae4", // Forearm X-ray
+            "e6d7bca3-cb2f-4926-bfbc-f89e90d573cd", // Humerus X-ray
+            "97589f4b-8bf9-4342-b24f-605d359ce932", // Toe X-ray
+            "e309ea51-86cd-4a83-883b-d5f8654e6627", // Shoulder X-ray
+            "addae1d8-baa2-459c-b869-e98f0303a688", // Ankle X-ray
+            "245e29a4-82de-4662-b176-92c768e49118", // Leg X-ray
+            "c82d4492-308d-455d-9bf9-360c3a086743", // Hand X-ray
+            "3765eebc-1324-4555-99c8-2b9324d5a185", // Pelvis X-ray
+            "c9f0148b-362a-4b11-9bc3-8c3428a9bbb4", // Calcaneus X-ray
+            "1bd135e8-d15c-45b4-9bc2-a232f5358912", // Coccyx X-ray
+            "1407617f-d79a-43a5-868b-7dedcd2c560f", // Neck X-ray
+            "bb1b2daf-584c-4bb6-8de2-aa678c7231fa", // Elbow X-ray
+            "ba2a2d62-8220-45a7-9302-9092c48a363d", // Skull X-ray
+            "c95e8fa1-b395-4042-9513-d8f33fb81a05", // Finger X-ray
+            "41d7e98f-d485-4d27-81fc-70d44e9d6e1d", // Femur X-ray
+            "1cb9c9f6-d3ad-42db-b38e-9cefa0b258fe", // Knee X-ray
+            "740f0b00-3c24-4c86-b95b-b5c6a7208625", // Foot X-ray
+            "bdd5be47-fc95-4ae3-9319-a8283eeead6a", // Wrist X-ray
+            "e4b471d9-81d6-48c4-8b97-20fdeeeac280", // C-Spine X-ray
+            "30cdefe7-775b-4302-b165-f2540fa207da", // L-Spine X-ray
+            "0c6e5f9a-75cf-444c-9415-6c2ac870392c", // T-Spine X-ray
+            "bc52d033-8df5-466b-abf9-e0679b42c043"))); // Sacrum X-ray
 
     private final Set<String> uuids;
 

@@ -67,6 +67,12 @@ class SaleOrderLineHandlerTest {
 
     private static final String PRODUCT_UOM_ID = "16";
 
+    private static final String MILLILITER = "bf712910-1c7f-4e72-9d50-6eb5453efcfd";
+
+    private static final String GRAM = "c2beca4d-0e35-4989-8e9d-54134982bb37";
+
+    private static final String TABLET = "391d2a1b-2aec-4bd7-b43b-e294e7f2b9b9";
+
     @AfterAll
     public static void close() throws Exception {
         mocksCloser.close();
@@ -233,6 +239,60 @@ class SaleOrderLineHandlerTest {
         assertNotNull(result);
         assertEquals(5.0f, saleOrderLine.getSaleOrderLineProductUomQty());
         assertEquals(999, saleOrderLine.getSaleOrderLineProductUom());
+    }
+
+    // UVL-EMR #385: a syrup prescribed in mL and priced per bottle was billed 10 x the bottle price
+    @Test
+    public void shouldBillOneContainerWhenTheDispensingUnitMeasuresAnAmount() {
+        saleOrderLineHandler.setPerContainerUoms(" " + MILLILITER + " , " + GRAM);
+
+        SaleOrderLine result = buildMedicationLine(10.0f, MILLILITER);
+
+        assertEquals(1.0f, result.getSaleOrderLineProductUomQty());
+        assertEquals(999, result.getSaleOrderLineProductUom());
+    }
+
+    @Test
+    public void shouldBillTheCountWhenTheDispensingUnitCountsContainersOrTablets() {
+        saleOrderLineHandler.setPerContainerUoms(MILLILITER + "," + GRAM);
+
+        SaleOrderLine result = buildMedicationLine(20.0f, TABLET);
+
+        assertEquals(20.0f, result.getSaleOrderLineProductUomQty());
+    }
+
+    @Test
+    public void shouldBillThePrescribedQuantityWhenNoPerContainerUnitIsConfigured() {
+        saleOrderLineHandler.setPerContainerUoms("");
+
+        SaleOrderLine result = buildMedicationLine(10.0f, MILLILITER);
+
+        assertEquals(10.0f, result.getSaleOrderLineProductUomQty());
+    }
+
+    private SaleOrderLine buildMedicationLine(float quantity, String unit) {
+        Resource resource = new MedicationRequest();
+        Uom uom = new Uom();
+        uom.setUomResId(999);
+        SaleOrder saleOrder = new SaleOrder();
+        saleOrder.setOrderId(ORDER_ID);
+        Product product = new Product();
+        product.setProductResId(PRODUCT_ID);
+        SaleOrderLine saleOrderLine = odooUtils.convertToObject(
+                getSaleOrderLineMap(1, "Paracetamol Sirop | 10 Milliliter", ORDER_ID, PRODUCT_ID, quantity, unit),
+                SaleOrderLine.class);
+        when(productHandler.getProduct(resource)).thenReturn(product);
+        when(odooClient.searchAndRead(
+                        Constants.SALE_ORDER_LINE_MODEL,
+                        asList(asList("order_id", "=", ORDER_ID), asList("product_id", "=", PRODUCT_ID)),
+                        null))
+                .thenReturn(new Object[] {});
+        when(saleOrderLineMapper.toOdoo(resource)).thenReturn(saleOrderLine);
+        when(uomHandler.getUom(unit)).thenReturn(uom);
+
+        SaleOrderLine result = saleOrderLineHandler.buildSaleOrderLineIfProductExists(resource, saleOrder);
+        assertNotNull(result);
+        return result;
     }
 
     public Map<String, Object> getSaleOrderLineMap(

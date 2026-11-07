@@ -49,4 +49,12 @@ public class SaleOrder implements OdooResource {
 
     @JsonProperty("company_id")
     private Object companyId; // Can be Integer on write, [id, name] list on read
+
+    // insurance_coverage addon plans. Integer plan id, Boolean.FALSE for an explicit "no plan", or null to
+    // leave the field out so that Odoo defaults it from the patient.
+    @JsonProperty("insurance_base_id")
+    private Object insuranceBaseId;
+
+    @JsonProperty("insurance_complementary_id")
+    private Object insuranceComplementaryId;
 }

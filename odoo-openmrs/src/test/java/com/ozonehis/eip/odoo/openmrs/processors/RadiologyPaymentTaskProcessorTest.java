@@ -10,7 +10,10 @@ package com.ozonehis.eip.odoo.openmrs.processors;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -25,6 +28,7 @@ import com.ozonehis.eip.odoo.openmrs.handlers.odoo.RadiologyPaymentEvidenceHandl
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.EncounterHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.TaskHandler;
 import java.util.Date;
+import java.util.Set;
 import org.apache.camel.Exchange;
 import org.apache.camel.impl.DefaultCamelContext;
 import org.apache.camel.support.DefaultExchange;
@@ -61,6 +65,8 @@ class RadiologyPaymentTaskProcessorTest {
 
     private Task task;
 
+    private EncounterHandler encounterHandler;
+
     private RadiologyPaymentTaskProcessor processor;
 
     @BeforeEach
@@ -84,7 +90,7 @@ class RadiologyPaymentTaskProcessorTest {
         taskHandler = mock(TaskHandler.class);
         when(taskHandler.getTaskByServiceRequestId(SR_ID)).thenReturn(task);
 
-        EncounterHandler encounterHandler = mock(EncounterHandler.class);
+        encounterHandler = mock(EncounterHandler.class);
         Encounter encounter = new Encounter();
         encounter.setPartOf(new Reference("Encounter/" + FakeOdoo.VISIT));
         when(encounterHandler.getEncounterByEncounterID(ENCOUNTER)).thenReturn(encounter);
@@ -192,5 +198,59 @@ class RadiologyPaymentTaskProcessorTest {
         poll();
 
         verify(taskHandler).updateTaskStatus(task, Task.TaskStatus.ACCEPTED);
+    }
+
+    /**
+     * UVL-EMR#316: an unpaid order is re-checked on every poll, and each check used to read its Encounter
+     * again. The visit is now resolved once per watched order.
+     */
+    @Test
+    void unpaidOrderResolvesItsVisitOnceAcrossPolls() {
+        odoo.line(6200, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.unpaidInvoice(9, "INV/2026/09/0009", 1.0, 6200);
+
+        poll();
+        poll();
+        poll();
+
+        verify(encounterHandler, times(1)).getEncounterByEncounterID(ENCOUNTER);
+        verify(taskHandler, never()).updateTaskStatus(any(), eq(Task.TaskStatus.ACCEPTED));
+        assertEquals(Set.of(SR_ID), processor.getAwaitingPayment());
+    }
+
+    /** UVL-EMR#316: once paid, the order is no longer waited for. */
+    @Test
+    void paidOrderIsNoLongerAwaitingPayment() {
+        odoo.line(6200, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.unpaidInvoice(9, "INV/2026/09/0009", 1.0, 6200);
+        poll();
+        assertEquals(Set.of(SR_ID), processor.getAwaitingPayment());
+
+        task.setStatus(Task.TaskStatus.ACCEPTED);
+        poll();
+
+        assertTrue(processor.getAwaitingPayment().isEmpty());
+    }
+
+    /**
+     * UVL-EMR#316: an order that leaves the look-back window unpaid stops being watched (it is reported at
+     * WARN), and its visit is no longer kept.
+     */
+    @Test
+    void orderLeavingTheWindowUnpaidIsDropped() {
+        odoo.line(6200, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.unpaidInvoice(9, "INV/2026/09/0009", 1.0, 6200);
+        poll();
+
+        when(srQuery.execute()).thenReturn(new Bundle());
+        poll();
+        assertTrue(processor.getAwaitingPayment().isEmpty());
+
+        Bundle back = new Bundle();
+        back.addEntry().setResource(serviceRequest(RadiologyConcepts.DEFAULT_UUIDS.iterator().next(), PROCEDURE));
+        when(srQuery.execute()).thenReturn(back);
+        poll();
+
+        verify(encounterHandler, times(2)).getEncounterByEncounterID(ENCOUNTER);
     }
 }

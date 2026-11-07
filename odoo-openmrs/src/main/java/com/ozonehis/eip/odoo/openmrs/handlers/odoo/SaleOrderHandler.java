@@ -12,7 +12,10 @@ import static java.util.Arrays.asList;
 import com.ozonehis.eip.odoo.openmrs.Constants;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
 import com.ozonehis.eip.odoo.openmrs.client.OdooUtils;
+import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.MedicationDispenseHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.ObservationHandler;
+import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.OrderHandler;
+import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.OrderHandler.DrugOrderInVisit;
 import com.ozonehis.eip.odoo.openmrs.mapper.odoo.SaleOrderMapper;
 import com.ozonehis.eip.odoo.openmrs.model.Partner;
 import com.ozonehis.eip.odoo.openmrs.model.Product;
@@ -26,8 +29,10 @@ import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.camel.ProducerTemplate;
 import org.hl7.fhir.r4.model.Encounter;
+import org.hl7.fhir.r4.model.MedicationRequest;
 import org.hl7.fhir.r4.model.Observation;
 import org.hl7.fhir.r4.model.Resource;
+import org.hl7.fhir.r4.model.ServiceRequest;
 import org.openmrs.eip.EIPException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -68,7 +73,22 @@ public class SaleOrderHandler {
     @Autowired
     private OdooUtils odooUtils;
 
+    @Autowired
+    private OrderHandler orderHandler;
+
+    @Autowired
+    private MedicationDispenseHandler medicationDispenseHandler;
+
+    @Autowired
+    private InsurancePayerHandler insurancePayerHandler;
+
     public List<String> orderDefaultAttributes;
+
+    // Odoo sale order states that are still a quotation, so their lines may be changed
+    private static final List<String> QUOTATION_STATES = List.of("draft", "sent");
+
+    // Fulfiller statuses the dispensing app sets when the pharmacist pauses or closes a prescription
+    private static final List<String> NOT_DISPENSED_FULFILLER_STATUSES = List.of("ON_HOLD", "DECLINED");
 
     public SaleOrder getDraftSaleOrderIfExistsByVisitId(String visitId, Integer companyId) {
         orderDefaultAttributes = asList(
@@ -123,6 +143,68 @@ public class SaleOrderHandler {
             String patientID,
             Integer companyId,
             ProducerTemplate producerTemplate) {
+        // A payer changed since the quotation was created is not applied to it, but noted on it (UVL-EMR#219).
+        insurancePayerHandler.noteVisitPayerChange(saleOrder, encounterVisitUuid);
+
+        Float serviceRequestQuantity = null;
+        if (resource instanceof ServiceRequest serviceRequest) {
+            Product product = productHandler.getProduct(resource);
+            if (product != null) {
+                SaleOrderLine existingLine = saleOrderLineHandler.getSaleOrderLineIfExists(
+                        saleOrder.getOrderId(), product.getProductResId());
+                serviceRequestQuantity = getServiceRequestQuantity(
+                        serviceRequest, product, saleOrder.getOrderId(), encounterVisitUuid, companyId);
+                if (existingLine != null) {
+                    // A repeat of a test already on the quotation (UVL-EMR#360): one line per test, counted.
+                    updateServiceRequestLineQuantity(
+                            serviceRequest, existingLine, serviceRequestQuantity, saleOrder, producerTemplate);
+                    return;
+                }
+                if (serviceRequestQuantity != null && serviceRequestQuantity <= 0) {
+                    log.info(
+                            "ServiceRequest {}: every order of this test in visit {} is already on a confirmed sale"
+                                    + " order. No line added to quotation {}.",
+                            serviceRequest.getIdPart(),
+                            encounterVisitUuid,
+                            saleOrder.getOrderId());
+                    return;
+                }
+            }
+        }
+
+        Float medicationRequestQuantity = null;
+        if (resource instanceof MedicationRequest medicationRequest) {
+            Product product = productHandler.getProduct(resource);
+            if (product != null) {
+                medicationRequestQuantity = getMedicationRequestQuantity(
+                        medicationRequest, product, saleOrder.getOrderId(), encounterVisitUuid, companyId);
+            }
+            if (medicationRequestQuantity != null) {
+                SaleOrderLine existingLine = saleOrderLineHandler.getSaleOrderLineIfExists(
+                        saleOrder.getOrderId(), product.getProductResId());
+                if (existingLine != null) {
+                    // A repeat prescription of a drug already on the quotation (UVL-EMR#544): one line per drug.
+                    // Only raised here, so that a quantity the cashier raised by hand (a second bottle) is not
+                    // lowered by the next dispense; a stopped order lowers it (updateMedicationRequestLineQuantity).
+                    setMedicationRequestLineQuantity(
+                            medicationRequest, existingLine, medicationRequestQuantity, true, producerTemplate);
+                    return;
+                }
+                if (medicationRequestQuantity <= 0) {
+                    log.info(
+                            "MedicationRequest {}: nothing of this drug in visit {} is left to bill. No line added to"
+                                    + " quotation {}.",
+                            medicationRequest.getIdPart(),
+                            encounterVisitUuid,
+                            saleOrder.getOrderId());
+                    return;
+                }
+            } else if (isMedicationRequestBilledElsewhere(
+                    medicationRequest, saleOrder.getOrderId(), encounterVisitUuid, companyId)) {
+                return;
+            }
+        }
+
         // If sale order exists create sale order line and link it to sale order
         SaleOrderLine saleOrderLine = saleOrderLineHandler.buildSaleOrderLineIfProductExists(resource, saleOrder);
         if (saleOrderLine == null) {
@@ -133,6 +215,12 @@ public class SaleOrderHandler {
             return;
         }
         saleOrderLine.setSaleOrderLineCompanyId(companyId);
+        if (serviceRequestQuantity != null) {
+            saleOrderLine.setSaleOrderLineProductUomQty(serviceRequestQuantity);
+        }
+        if (medicationRequestQuantity != null) {
+            saleOrderLine.setSaleOrderLineProductUomQty(medicationRequestQuantity);
+        }
 
         // Update sale order with Patient Weight if not already present
         if (saleOrder.getPartnerWeight() == null
@@ -156,6 +244,43 @@ public class SaleOrderHandler {
             String patientID,
             Integer companyId,
             ProducerTemplate producerTemplate) {
+        Float serviceRequestQuantity = null;
+        if (resource instanceof ServiceRequest serviceRequest) {
+            Product product = productHandler.getProduct(resource);
+            if (product != null) {
+                serviceRequestQuantity =
+                        getServiceRequestQuantity(serviceRequest, product, null, encounterVisitUuid, companyId);
+                if (serviceRequestQuantity != null && serviceRequestQuantity <= 0) {
+                    log.info(
+                            "ServiceRequest {}: every order of this test in visit {} is already on a confirmed sale"
+                                    + " order. No quotation created.",
+                            serviceRequest.getIdPart(),
+                            encounterVisitUuid);
+                    return;
+                }
+            }
+        }
+
+        Float medicationRequestQuantity = null;
+        if (resource instanceof MedicationRequest medicationRequest) {
+            Product product = productHandler.getProduct(resource);
+            if (product != null) {
+                medicationRequestQuantity =
+                        getMedicationRequestQuantity(medicationRequest, product, null, encounterVisitUuid, companyId);
+            }
+            if (medicationRequestQuantity != null && medicationRequestQuantity <= 0) {
+                log.info(
+                        "MedicationRequest {}: nothing of this drug in visit {} is left to bill. No quotation created.",
+                        medicationRequest.getIdPart(),
+                        encounterVisitUuid);
+                return;
+            }
+            if (medicationRequestQuantity == null
+                    && isMedicationRequestBilledElsewhere(medicationRequest, null, encounterVisitUuid, companyId)) {
+                return;
+            }
+        }
+
         // If the sale order does not exist, create it, then create sale order line and link it to sale order
         SaleOrder newSaleOrder = saleOrderMapper.toOdoo(encounter);
         newSaleOrder.setOrderPartnerId(partner.getPartnerId());
@@ -169,6 +294,10 @@ public class SaleOrderHandler {
         if (patientWeight != null) {
             newSaleOrder.setPartnerWeight(getPartnerWeight(patientID));
         }
+        // The plans that pay for the visit, from its payers. Set once, on the new quotation: a payer changed
+        // after the visit's first order is not applied to it, but noted on it.
+        // Never throws: a payer with no plan bills the patient and is noted on the quotation below.
+        String payerProblem = insurancePayerHandler.applyVisitPayer(newSaleOrder, encounterVisitUuid);
 
         sendSaleOrder(producerTemplate, "direct:odoo-create-sale-order-route", newSaleOrder);
         log.debug(
@@ -176,6 +305,7 @@ public class SaleOrderHandler {
 
         SaleOrder fetchedSaleOrder = getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid, companyId);
         if (fetchedSaleOrder != null) {
+            insurancePayerHandler.noteVisitPayerProblem(fetchedSaleOrder, payerProblem);
             SaleOrderLine saleOrderLine =
                     saleOrderLineHandler.buildSaleOrderLineIfProductExists(resource, fetchedSaleOrder);
             if (saleOrderLine == null) {
@@ -186,6 +316,12 @@ public class SaleOrderHandler {
                 return;
             }
             saleOrderLine.setSaleOrderLineCompanyId(companyId);
+            if (serviceRequestQuantity != null) {
+                saleOrderLine.setSaleOrderLineProductUomQty(serviceRequestQuantity);
+            }
+            if (medicationRequestQuantity != null) {
+                saleOrderLine.setSaleOrderLineProductUomQty(medicationRequestQuantity);
+            }
 
             producerTemplate.sendBody("direct:odoo-create-sale-order-line-route", saleOrderLine);
             log.debug(
@@ -209,6 +345,485 @@ public class SaleOrderHandler {
                             producerTemplate, "direct:odoo-delete-sale-order-line-route", saleOrderLine);
                 }
             }
+        }
+    }
+
+    /**
+     * Takes the line of an order that was cancelled before it was carried out (discontinued, or closed by
+     * the pharmacy without dispensing) off the visit's quotation, so it is not invoiced.
+     *
+     * <p>Only a quotation (state draft or sent) is changed. The line is unlinked; if Odoo refuses, its
+     * quantity is set to 0 instead. A confirmed, locked or invoiced sale order is never touched: the line is
+     * reported at WARN so that billing can correct it by hand.
+     */
+    public void removeSaleOrderLineFromQuotation(
+            Resource resource, String encounterVisitUuid, Integer companyId, ProducerTemplate producerTemplate) {
+        Product product = productHandler.getProduct(resource);
+        if (product == null) {
+            log.info(
+                    "{} {}: no Odoo product, so no sale order line to remove for visit {}",
+                    resource.fhirType(),
+                    resource.getIdPart(),
+                    encounterVisitUuid);
+            return;
+        }
+
+        List<Object> criteria = new ArrayList<>();
+        criteria.add(asList("client_order_ref", "=", encounterVisitUuid));
+        criteria.add(asList("state", "!=", "cancel"));
+        if (companyId != null) {
+            criteria.add(asList("company_id", "=", companyId));
+        }
+        Object[] records =
+                odooClient.searchAndRead(Constants.SALE_ORDER_MODEL, criteria, asList("id", "name", "state"));
+        if (records == null) {
+            throw new EIPException(String.format(
+                    "Got null response while fetching for Sale order with client_order_ref %s", encounterVisitUuid));
+        }
+
+        boolean found = false;
+        for (Object record : records) {
+            Map<String, Object> saleOrder = (Map<String, Object>) record;
+            int saleOrderId = (Integer) saleOrder.get("id");
+            String state = String.valueOf(saleOrder.get("state"));
+            SaleOrderLine saleOrderLine =
+                    saleOrderLineHandler.getSaleOrderLineIfExists(saleOrderId, product.getProductResId());
+            if (saleOrderLine == null) {
+                continue;
+            }
+            found = true;
+            if (QUOTATION_STATES.contains(state)) {
+                removeQuotationLine(saleOrderLine, producerTemplate);
+                log.info(
+                        "{} {}: removed sale order line {} from quotation {} ({}) of visit {}",
+                        resource.fhirType(),
+                        resource.getIdPart(),
+                        saleOrderLine.getSaleOrderLineId(),
+                        saleOrder.get("name"),
+                        state,
+                        encounterVisitUuid);
+            } else {
+                log.warn(
+                        "{} {} was stopped (discontinued, paused or closed) before it was carried out, but its"
+                                + " line {} is on sale order {} in"
+                                + " state {} for visit {}. Confirmed sale orders are not changed: correct the"
+                                + " invoice in Odoo.",
+                        resource.fhirType(),
+                        resource.getIdPart(),
+                        saleOrderLine.getSaleOrderLineId(),
+                        saleOrder.get("name"),
+                        state,
+                        encounterVisitUuid);
+            }
+        }
+        if (!found) {
+            log.info(
+                    "{} {}: no sale order line to remove for visit {}",
+                    resource.fhirType(),
+                    resource.getIdPart(),
+                    encounterVisitUuid);
+        }
+    }
+
+    /**
+     * Lowers the quantity of a lab or procedure line on the visit's draft quotation when one of several orders
+     * of that test is discontinued before it is done (UVL-EMR#360).
+     *
+     * @return true when the line was kept with the remaining orders' quantity; false when the caller should
+     *     remove the line as before: no other order of the test is left, the line is not on the draft
+     *     quotation, or the orders could not be counted
+     */
+    public boolean reduceServiceRequestLineQuantity(
+            ServiceRequest serviceRequest,
+            String encounterVisitUuid,
+            Integer companyId,
+            ProducerTemplate producerTemplate) {
+        SaleOrder saleOrder = getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid, companyId);
+        if (saleOrder == null) {
+            return false;
+        }
+        Product product = productHandler.getProduct(serviceRequest);
+        if (product == null) {
+            return false;
+        }
+        SaleOrderLine line =
+                saleOrderLineHandler.getSaleOrderLineIfExists(saleOrder.getOrderId(), product.getProductResId());
+        if (line == null) {
+            return false;
+        }
+        Float quantity = getServiceRequestQuantity(
+                serviceRequest, product, saleOrder.getOrderId(), encounterVisitUuid, companyId);
+        if (quantity == null || quantity <= 0) {
+            return false;
+        }
+        updateServiceRequestLineQuantity(serviceRequest, line, quantity, saleOrder, producerTemplate);
+        return true;
+    }
+
+    /**
+     * Whether the visit's other, non-cancelled sale orders already bill this prescription.
+     *
+     * <p>Every dispense, pause or other update of a MedicationRequest is processed again. Once the visit's
+     * quotation is confirmed (for example the cashier takes payment for an X-ray before the pharmacy
+     * dispenses), there is no draft quotation left, so without this check the update created a new quotation
+     * holding the drug a second time. A drug line carries no link to its order, so lines are counted: when the
+     * other sale orders hold at least as many lines for this drug's product as the visit has billable orders of
+     * the drug, the prescription is billed already. A new prescription of the same drug later in the visit
+     * still gets a line.
+     *
+     * @param quotationId the quotation being changed, which is not counted; null when it is yet to be created
+     */
+    boolean isMedicationRequestBilledElsewhere(
+            MedicationRequest medicationRequest, Integer quotationId, String encounterVisitUuid, Integer companyId) {
+        Product product = productHandler.getProduct(medicationRequest);
+        if (product == null) {
+            return false;
+        }
+
+        List<Object> criteria = new ArrayList<>();
+        criteria.add(asList("order_id.client_order_ref", "=", encounterVisitUuid));
+        criteria.add(asList("order_id.state", "!=", "cancel"));
+        criteria.add(asList("product_id", "=", product.getProductResId()));
+        if (companyId != null) {
+            criteria.add(asList("order_id.company_id", "=", companyId));
+        }
+        Object[] lines = odooClient.searchAndRead(Constants.SALE_ORDER_LINE_MODEL, criteria, asList("id", "order_id"));
+        if (lines == null) {
+            throw new EIPException(String.format(
+                    "Got null response while fetching sale order lines of product %s for visit %s",
+                    product.getProductResId(), encounterVisitUuid));
+        }
+        int linesElsewhere = 0;
+        for (Object record : lines) {
+            Object orderId = ((Map<String, Object>) record).get("order_id");
+            if (orderId instanceof Object[] pair && pair.length > 0) {
+                // XML-RPC returns a many2one as [id, name]
+                orderId = pair[0];
+            }
+            if (quotationId == null || !quotationId.equals(orderId)) {
+                linesElsewhere++;
+            }
+        }
+        if (linesElsewhere == 0) {
+            return false;
+        }
+
+        Integer billableOrders;
+        try {
+            billableOrders = orderHandler.countBillableOrdersInVisit(medicationRequest.getIdPart());
+        } catch (Exception e) {
+            log.warn(
+                    "MedicationRequest {}: could not count the orders of this drug in visit {}: {}",
+                    medicationRequest.getIdPart(),
+                    encounterVisitUuid,
+                    e.getMessage());
+            billableOrders = null;
+        }
+        if (billableOrders != null && billableOrders > linesElsewhere) {
+            return false;
+        }
+        // Billing a drug twice is worse than missing a repeat, so a count that cannot be read counts as billed.
+        log.info(
+                "MedicationRequest {}: other sale orders of visit {} already hold {} line(s) for this drug ({}"
+                        + " billable order(s)). No line added.",
+                medicationRequest.getIdPart(),
+                encounterVisitUuid,
+                linesElsewhere,
+                billableOrders == null ? "unknown" : billableOrders);
+        return true;
+    }
+
+    /**
+     * The quantity a lab or procedure line on the visit's quotation should carry (UVL-EMR#360): the billable
+     * orders of that test in the visit (see {@link OrderHandler#countBillableOrdersInVisit}), less what the
+     * visit's other, non-cancelled sale orders already bill for it. Without the subtraction, a repeat ordered
+     * after the first quotation was confirmed would bill the first order a second time.
+     *
+     * @param quotationId the quotation being changed, which is not subtracted; null when it is yet to be created
+     * @return the quantity, possibly 0 or less when confirmed sale orders already cover every order; or null
+     *     when the orders cannot be counted, in which case the caller keeps the one-line-per-test behaviour
+     */
+    Float getServiceRequestQuantity(
+            ServiceRequest serviceRequest,
+            Product product,
+            Integer quotationId,
+            String encounterVisitUuid,
+            Integer companyId) {
+        Integer billableOrders;
+        try {
+            billableOrders = orderHandler.countBillableOrdersInVisit(serviceRequest.getIdPart());
+        } catch (Exception e) {
+            log.warn(
+                    "ServiceRequest {}: could not count the orders of this test in visit {}, so its quantity is not"
+                            + " changed: {}",
+                    serviceRequest.getIdPart(),
+                    encounterVisitUuid,
+                    e.getMessage());
+            return null;
+        }
+        if (billableOrders == null) {
+            return null;
+        }
+        return billableOrders - getQuantityBilledElsewhere(product, quotationId, encounterVisitUuid, companyId);
+    }
+
+    /**
+     * What the visit's non-cancelled sale orders, other than the given quotation, already bill of the product.
+     *
+     * @param quotationId the quotation being changed, which is not counted; null when it is yet to be created
+     */
+    private float getQuantityBilledElsewhere(
+            Product product, Integer quotationId, String encounterVisitUuid, Integer companyId) {
+        List<Object> criteria = new ArrayList<>();
+        criteria.add(asList("order_id.client_order_ref", "=", encounterVisitUuid));
+        criteria.add(asList("order_id.state", "!=", "cancel"));
+        criteria.add(asList("product_id", "=", product.getProductResId()));
+        if (companyId != null) {
+            criteria.add(asList("order_id.company_id", "=", companyId));
+        }
+        Object[] lines = odooClient.searchAndRead(
+                Constants.SALE_ORDER_LINE_MODEL, criteria, asList("id", "order_id", "product_uom_qty"));
+        if (lines == null) {
+            throw new EIPException(String.format(
+                    "Got null response while fetching sale order lines of product %s for visit %s",
+                    product.getProductResId(), encounterVisitUuid));
+        }
+        float billedElsewhere = 0;
+        for (Object record : lines) {
+            Map<String, Object> line = (Map<String, Object>) record;
+            Object orderId = line.get("order_id");
+            if (orderId instanceof Object[] pair && pair.length > 0) {
+                // XML-RPC returns a many2one as [id, name]
+                orderId = pair[0];
+            }
+            if (quotationId != null && quotationId.equals(orderId)) {
+                continue;
+            }
+            Object quantity = line.get("product_uom_qty");
+            if (quantity instanceof Number number) {
+                billedElsewhere += number.floatValue();
+            }
+        }
+        return billedElsewhere;
+    }
+
+    /**
+     * Sets the drug's line on the visit's draft quotation to what the visit's prescriptions of the drug still bill,
+     * once one of them is stopped (discontinued, revised, voided) or paused or closed by the pharmacy (UVL-EMR#544).
+     * A stopped prescription keeps what was dispensed against it; one stopped before anything was dispensed no
+     * longer counts.
+     *
+     * @return true when the drug is still billed and its line was kept, with the new quantity; false when the
+     *     caller should remove the line as before: nothing of the drug is left to bill, or the orders could not be
+     *     read
+     */
+    public boolean updateMedicationRequestLineQuantity(
+            MedicationRequest medicationRequest,
+            String encounterVisitUuid,
+            Integer companyId,
+            ProducerTemplate producerTemplate) {
+        Product product = productHandler.getProduct(medicationRequest);
+        if (product == null) {
+            return false;
+        }
+        SaleOrder saleOrder = getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid, companyId);
+        Float quantity = getMedicationRequestQuantity(
+                medicationRequest,
+                product,
+                saleOrder == null ? null : saleOrder.getOrderId(),
+                encounterVisitUuid,
+                companyId);
+        if (quantity == null || quantity <= 0) {
+            return false;
+        }
+        SaleOrderLine line = saleOrder == null
+                ? null
+                : saleOrderLineHandler.getSaleOrderLineIfExists(saleOrder.getOrderId(), product.getProductResId());
+        if (line == null) {
+            log.info(
+                    "MedicationRequest {}: {} of this drug is still to bill in visit {}, but it has no line on a draft"
+                            + " quotation. Nothing changed.",
+                    medicationRequest.getIdPart(),
+                    quantity,
+                    encounterVisitUuid);
+            return true;
+        }
+        setMedicationRequestLineQuantity(medicationRequest, line, quantity, false, producerTemplate);
+        return true;
+    }
+
+    /**
+     * The quantity a drug's line on the visit's quotation should carry (UVL-EMR#544), summed over the visit's
+     * prescriptions of the drug (see {@link OrderHandler#getDrugOrdersInVisit}), less what the visit's other,
+     * non-cancelled sale orders already bill for it:
+     *
+     * <ul>
+     *   <li>an active prescription bills its quantity to dispense, as a drug line always did, so that it can be
+     *       paid before it is dispensed; paused or closed by the pharmacy with nothing dispensed, it bills nothing
+     *       (UVL-EMR#393)
+     *   <li>a stopped prescription (discontinued or revised) bills what was dispensed against it, nothing if
+     *       nothing was
+     *   <li>a prescription in a per-container unit (odoo.per.container.uoms) bills one container (UVL-EMR#385)
+     * </ul>
+     *
+     * @param quotationId the quotation being changed, which is not subtracted; null when it is yet to be created
+     * @return the quantity, possibly 0 or less; or null when the prescriptions cannot be read, in which case the
+     *     caller keeps the one-line-per-drug behaviour
+     */
+    Float getMedicationRequestQuantity(
+            MedicationRequest medicationRequest,
+            Product product,
+            Integer quotationId,
+            String encounterVisitUuid,
+            Integer companyId) {
+        List<DrugOrderInVisit> drugOrders;
+        try {
+            drugOrders = orderHandler.getDrugOrdersInVisit(medicationRequest.getIdPart());
+        } catch (Exception e) {
+            log.warn(
+                    "MedicationRequest {}: could not read the prescriptions of this drug in visit {}: {}",
+                    medicationRequest.getIdPart(),
+                    encounterVisitUuid,
+                    e.getMessage());
+            return null;
+        }
+        // The prescription itself is among them unless it was voided: an empty list is read as not known
+        if (drugOrders == null || drugOrders.isEmpty()) {
+            return null;
+        }
+
+        float quantity = 0;
+        for (DrugOrderInVisit drugOrder : drugOrders) {
+            quantity += getBilledQuantity(drugOrder);
+        }
+        float billedElsewhere = getQuantityBilledElsewhere(product, quotationId, encounterVisitUuid, companyId);
+        log.debug(
+                "MedicationRequest {}: {} order(s) of this drug in visit {} bill {}, of which {} on other sale orders",
+                medicationRequest.getIdPart(),
+                drugOrders.size(),
+                encounterVisitUuid,
+                quantity,
+                billedElsewhere);
+        return quantity - billedElsewhere;
+    }
+
+    private float getBilledQuantity(DrugOrderInVisit drugOrder) {
+        boolean perContainer = saleOrderLineHandler.isPerContainerUom(drugOrder.quantityUnits());
+        // A prescription without a quantity was billed as one unit (Odoo's default line quantity)
+        float prescribed = perContainer || drugOrder.quantity() == null ? 1f : drugOrder.quantity();
+        boolean pausedOrClosed = drugOrder.fulfillerStatus() != null
+                && NOT_DISPENSED_FULFILLER_STATUSES.contains(drugOrder.fulfillerStatus());
+        if (drugOrder.active() && !pausedOrClosed) {
+            return prescribed;
+        }
+        if (!medicationDispenseHandler.hasDispensedQuantity(drugOrder.uuid())) {
+            return 0;
+        }
+        if (drugOrder.active() || perContainer) {
+            // Paused or closed after part of it was dispensed: billed as before (UVL-EMR#386)
+            return prescribed;
+        }
+        float dispensed = medicationDispenseHandler.getDispensedQuantity(drugOrder.uuid(), drugOrder.quantityUnits());
+        // Dispensed in another unit than prescribed: the prescription is billed as it was ordered
+        return dispensed > 0 ? dispensed : prescribed;
+    }
+
+    private void setMedicationRequestLineQuantity(
+            MedicationRequest medicationRequest,
+            SaleOrderLine line,
+            float quantity,
+            boolean raiseOnly,
+            ProducerTemplate producerTemplate) {
+        Float current = line.getSaleOrderLineProductUomQty();
+        if (quantity <= 0) {
+            log.warn(
+                    "MedicationRequest {}: line {} is for a drug that the visit's other sale orders already bill in"
+                            + " full. The line is left as it is: check it in Odoo.",
+                    medicationRequest.getIdPart(),
+                    line.getSaleOrderLineId());
+            return;
+        }
+        if (current != null && (current == quantity || (raiseOnly && current > quantity))) {
+            log.debug(
+                    "MedicationRequest {}: line {} keeps quantity {} ({} to bill)",
+                    medicationRequest.getIdPart(),
+                    line.getSaleOrderLineId(),
+                    current,
+                    quantity);
+            return;
+        }
+        SaleOrderLine update = new SaleOrderLine();
+        update.setSaleOrderLineId(line.getSaleOrderLineId());
+        update.setSaleOrderLineProductUomQty(quantity);
+        saleOrderLineHandler.sendSaleOrderLine(producerTemplate, "direct:odoo-update-sale-order-line-route", update);
+        log.info(
+                "MedicationRequest {}: quantity of line {} set from {} to {}, what the prescriptions of this drug in"
+                        + " the visit bill",
+                medicationRequest.getIdPart(),
+                line.getSaleOrderLineId(),
+                current,
+                quantity);
+    }
+
+    private void updateServiceRequestLineQuantity(
+            ServiceRequest serviceRequest,
+            SaleOrderLine line,
+            Float quantity,
+            SaleOrder saleOrder,
+            ProducerTemplate producerTemplate) {
+        if (quantity == null) {
+            log.info(
+                    "ServiceRequest {}: test already on quotation {} (line {}). Its quantity is not changed.",
+                    serviceRequest.getIdPart(),
+                    saleOrder.getOrderId(),
+                    line.getSaleOrderLineId());
+            return;
+        }
+        if (quantity <= 0) {
+            log.warn(
+                    "ServiceRequest {}: quotation {} has line {} for a test that confirmed sale orders of the same"
+                            + " visit already bill in full. The line is left as it is: check it in Odoo.",
+                    serviceRequest.getIdPart(),
+                    saleOrder.getOrderId(),
+                    line.getSaleOrderLineId());
+            return;
+        }
+        if (quantity.equals(line.getSaleOrderLineProductUomQty())) {
+            log.debug(
+                    "ServiceRequest {}: line {} already has quantity {}",
+                    serviceRequest.getIdPart(),
+                    line.getSaleOrderLineId(),
+                    quantity);
+            return;
+        }
+        SaleOrderLine update = new SaleOrderLine();
+        update.setSaleOrderLineId(line.getSaleOrderLineId());
+        update.setSaleOrderLineProductUomQty(quantity);
+        saleOrderLineHandler.sendSaleOrderLine(producerTemplate, "direct:odoo-update-sale-order-line-route", update);
+        log.info(
+                "ServiceRequest {}: quantity of line {} on quotation {} set from {} to {}, the orders of this test"
+                        + " in the visit",
+                serviceRequest.getIdPart(),
+                line.getSaleOrderLineId(),
+                saleOrder.getOrderId(),
+                line.getSaleOrderLineProductUomQty(),
+                quantity);
+    }
+
+    private void removeQuotationLine(SaleOrderLine saleOrderLine, ProducerTemplate producerTemplate) {
+        try {
+            saleOrderLineHandler.sendSaleOrderLine(
+                    producerTemplate, "direct:odoo-delete-sale-order-line-route", saleOrderLine);
+        } catch (Exception e) {
+            log.warn(
+                    "Could not delete sale order line {}, setting its quantity to 0 instead: {}",
+                    saleOrderLine.getSaleOrderLineId(),
+                    e.getMessage());
+            SaleOrderLine zeroQuantity = new SaleOrderLine();
+            zeroQuantity.setSaleOrderLineId(saleOrderLine.getSaleOrderLineId());
+            zeroQuantity.setSaleOrderLineProductUomQty(0f);
+            saleOrderLineHandler.sendSaleOrderLine(
+                    producerTemplate, "direct:odoo-update-sale-order-line-route", zeroQuantity);
         }
     }
 
@@ -244,6 +859,121 @@ public class SaleOrderHandler {
 
         return observation.getValueQuantity().getValue() + " "
                 + observation.getValueQuantity().getUnit();
+    }
+
+    /**
+     * The nights of a stay product (UVL-EMR#246) still to bill on the visit's quotation: the stay's nights less
+     * what the visit's other non-cancelled sale orders already bill of the product. Never below 0: when they bill
+     * more nights than the stay has, nothing is taken back from them and it is reported at WARN.
+     *
+     * @param quotationId the visit's quotation, which is not subtracted; null when it is yet to be created
+     */
+    public float getStayNightsToBill(
+            Product product, int nights, Integer quotationId, String visitUuid, Integer companyId) {
+        float billedElsewhere = getQuantityBilledElsewhere(product, quotationId, visitUuid, companyId);
+        float toBill = nights - billedElsewhere;
+        if (toBill < 0) {
+            log.warn(
+                    "Visit {}: confirmed sale orders bill {} night(s) of product {} but the stay counts {}. Confirmed"
+                            + " sale orders are not changed: correct the invoice in Odoo.",
+                    visitUuid,
+                    billedElsewhere,
+                    product.getProductResId(),
+                    nights);
+            return 0;
+        }
+        return toBill;
+    }
+
+    /**
+     * Sets the line of a stay product on the visit's quotation to this many nights: added, changed, or removed
+     * when 0 (UVL-EMR#246). The quantity is recounted from the stay on every run and written as is, so running
+     * it again changes nothing. Only the quotation passed in is changed; the caller passes the visit's draft
+     * quotation, never a confirmed sale order.
+     */
+    public void upsertStayLine(
+            SaleOrder quotation, Product product, float nights, Integer companyId, ProducerTemplate producerTemplate) {
+        SaleOrderLine line =
+                saleOrderLineHandler.getSaleOrderLineIfExists(quotation.getOrderId(), product.getProductResId());
+        if (nights <= 0) {
+            if (line != null) {
+                removeQuotationLine(line, producerTemplate);
+                log.info(
+                        "Visit {}: stay line {} (product {}) removed from quotation {}, no night left to bill",
+                        quotation.getOrderClientOrderRef(),
+                        line.getSaleOrderLineId(),
+                        product.getProductResId(),
+                        quotation.getOrderId());
+            }
+            return;
+        }
+        if (line == null) {
+            SaleOrderLine newLine = new SaleOrderLine();
+            newLine.setSaleOrderLineOrderId(quotation.getOrderId());
+            newLine.setSaleOrderLineProductId(product.getProductResId());
+            newLine.setSaleOrderLineProductUomQty(nights);
+            // Units, as for every ServiceRequest line
+            newLine.setSaleOrderLineProductUom(1);
+            newLine.setSaleOrderLineCompanyId(companyId);
+            producerTemplate.sendBody("direct:odoo-create-sale-order-line-route", newLine);
+            log.info(
+                    "Visit {}: stay line added to quotation {}: product {}, {} night(s)",
+                    quotation.getOrderClientOrderRef(),
+                    quotation.getOrderId(),
+                    product.getProductResId(),
+                    nights);
+            return;
+        }
+        Float current = line.getSaleOrderLineProductUomQty();
+        if (current != null && current == nights) {
+            log.debug(
+                    "Visit {}: stay line {} keeps {} night(s)",
+                    quotation.getOrderClientOrderRef(),
+                    line.getSaleOrderLineId(),
+                    nights);
+            return;
+        }
+        SaleOrderLine update = new SaleOrderLine();
+        update.setSaleOrderLineId(line.getSaleOrderLineId());
+        update.setSaleOrderLineProductUomQty(nights);
+        saleOrderLineHandler.sendSaleOrderLine(producerTemplate, "direct:odoo-update-sale-order-line-route", update);
+        log.info(
+                "Visit {}: stay line {} (product {}) set from {} to {} night(s)",
+                quotation.getOrderClientOrderRef(),
+                line.getSaleOrderLineId(),
+                product.getProductResId(),
+                current,
+                nights);
+    }
+
+    /**
+     * Creates the visit's quotation, empty, for a stay billed before anything else on the visit, in the same way
+     * {@link #createSaleOrderWithSaleOrderLine} does, and returns it as read back from Odoo.
+     *
+     * @param encounter an encounter of the visit (its partOf is the visit)
+     */
+    public SaleOrder createStayQuotation(
+            Encounter encounter,
+            Partner partner,
+            String visitUuid,
+            String patientId,
+            Integer companyId,
+            ProducerTemplate producerTemplate) {
+        SaleOrder newSaleOrder = saleOrderMapper.toOdoo(encounter);
+        newSaleOrder.setOrderPartnerId(partner.getPartnerId());
+        newSaleOrder.setOrderState("draft");
+        newSaleOrder.setCompanyId(companyId);
+        newSaleOrder.setPartnerBirthDate(partner.getPartnerBirthDate());
+        if (partner.getPartnerExternalId() != null) {
+            newSaleOrder.setOdooCustomerId(partner.getPartnerExternalId().replaceAll("(?i)</?p>", ""));
+        }
+        String patientWeight = getPartnerWeight(patientId);
+        if (patientWeight != null) {
+            newSaleOrder.setPartnerWeight(patientWeight);
+        }
+        sendSaleOrder(producerTemplate, "direct:odoo-create-sale-order-route", newSaleOrder);
+        log.info("Visit {}: quotation created for the inpatient stay", visitUuid);
+        return getDraftSaleOrderIfExistsByVisitId(visitUuid, companyId);
     }
 
     private Object toMany2oneId(Object value) {

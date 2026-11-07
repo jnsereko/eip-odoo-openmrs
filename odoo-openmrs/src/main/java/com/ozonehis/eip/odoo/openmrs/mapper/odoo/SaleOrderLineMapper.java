@@ -17,11 +17,21 @@ import org.hl7.fhir.r4.model.Reference;
 import org.hl7.fhir.r4.model.Resource;
 import org.hl7.fhir.r4.model.ServiceRequest;
 import org.hl7.fhir.r4.model.SupplyRequest;
+import org.hl7.fhir.r4.model.Timing;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 @Slf4j
 @Component
 public class SaleOrderLineMapper<R extends Resource> implements ToOdooMapping<R, SaleOrderLine> {
+
+    /**
+     * Optional labels for the duration unit in the line text, e.g. {@code d=jour|jours,wk=semaine|semaines}, keyed by
+     * the FHIR unit code (s, min, h, d, wk, mo, a), singular|plural. FHIR's own display is fixed English ("day"), so
+     * without this a French site reads "5 day". Empty keeps that display.
+     */
+    @Value("${odoo.duration.unit.labels:}")
+    private String durationUnitLabels;
 
     @Override
     public SaleOrderLine toOdoo(R resource) {
@@ -105,15 +115,28 @@ public class SaleOrderLineMapper<R extends Resource> implements ToOdooMapping<R,
                                 && dosage.getTiming().getRepeat().getDuration() != null
                                 && dosage.getTiming().getRepeat().getDurationUnit() != null
                         ? dosage.getTiming().getRepeat().getDuration().toString() + " "
-                                + dosage.getTiming()
-                                        .getRepeat()
-                                        .getDurationUnit()
-                                        .getDisplay()
+                                + durationLabel(
+                                        dosage.getTiming().getRepeat().getDurationUnit(),
+                                        dosage.getTiming().getRepeat().getDuration())
                         : null);
 
         appendWithConditionalHyphen(dosageInstructions, dosage.getText());
 
         return dosageInstructions.toString();
+    }
+
+    String durationLabel(Timing.UnitsOfTime unit, java.math.BigDecimal duration) {
+        if (durationUnitLabels != null && !durationUnitLabels.isBlank()) {
+            for (String entry : durationUnitLabels.split(",")) {
+                String[] keyAndLabels = entry.trim().split("=", 2);
+                if (keyAndLabels.length == 2 && keyAndLabels[0].trim().equals(unit.toCode())) {
+                    String[] forms = keyAndLabels[1].split("\\|", 2);
+                    boolean singular = duration != null && duration.compareTo(java.math.BigDecimal.ONE) == 0;
+                    return (singular || forms.length == 1 ? forms[0] : forms[1]).trim();
+                }
+            }
+        }
+        return unit.getDisplay();
     }
 
     private void appendWithConditionalHyphen(StringBuilder builder, String text) {

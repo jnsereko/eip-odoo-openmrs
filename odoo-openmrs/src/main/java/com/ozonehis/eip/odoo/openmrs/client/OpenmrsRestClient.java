@@ -69,6 +69,21 @@ public class OpenmrsRestClient {
         return response.body();
     }
 
+    /**
+     * GETs a resource, or searches it when uuid is null, with the given query string (without the leading
+     * '?'), e.g. a custom representation. Returns null on 404.
+     */
+    public byte[] get(String resource, String uuid, String query) throws Exception {
+        String path = (uuid == null ? resource : resource + "/" + uuid) + "?" + query;
+        HttpResponse<byte[]> response =
+                sendRequest(path, null, null, false, Set.of(HttpStatus.OK.value(), HttpStatus.NOT_FOUND.value()));
+        if (response.statusCode() == HttpStatus.NOT_FOUND.value()) {
+            return null;
+        }
+
+        return response.body();
+    }
+
     public byte[] createOrUpdate(String resource, String uuid, String body) throws Exception {
         final HttpStatus expectedStatus = (uuid == null) ? HttpStatus.CREATED : HttpStatus.OK;
         return sendRequest(resource, uuid, body, false, Set.of(expectedStatus.value()))
