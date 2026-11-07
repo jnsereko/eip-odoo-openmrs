@@ -36,8 +36,11 @@ public class ProductHandler {
     private OdooUtils odooUtils;
 
     public Product getProduct(Resource resource) {
-        String externalId = getProductExternalId(resource);
+        return getProductByExternalId(getProductExternalId(resource));
+    }
 
+    /** The product whose external id (ir.model.data name) is this, e.g. the uuid of its OpenMRS concept. */
+    public Product getProductByExternalId(String externalId) {
         Object[] records = odooClient.searchAndRead(
                 Constants.IR_MODEL,
                 asList(asList("model", "=", Constants.PRODUCT_MODEL), asList("name", "=", externalId)),
