@@ -41,8 +41,10 @@ import org.springframework.stereotype.Component;
  * Transfer (at the destination ward) and a Discharge. A night is a midnight, in {@link #timezone}, between the
  * admission and the end of the stay: the Discharge, else the end of the visit, else now. Each midnight is billed
  * to the room class of the ward the patient was in at that midnight; a stay with fewer than {@link #minNights}
- * midnights is billed that many nights at the class of the admitting ward. The class of a ward is the product
- * mapped to the first configured location tag found on the ward or one of its parents, else the default product.
+ * midnights is billed that many nights at the class of the first bed of the stay, else of the admitting ward.
+ * The class of a midnight is the product mapped to the type of the bed the patient occupied at that midnight
+ * (bedmanagement's bed type, set per bed in the bed management app), else the product mapped to the first
+ * configured location tag found on the ward or one of its parents, else the default product.
  *
  * <p>The reads are SQL on the OpenMRS database, with every filter in the WHERE clause. A REST or FHIR search was
  * not used because OpenMRS silently ignores search parameters it does not support (the #322 lesson): an ignored
@@ -87,8 +89,39 @@ public class InpatientStayHandler {
             + " WHERE a.visit_id = v.visit_id AND a.voided = 0 AND aet.uuid IN (%s))"
             + " ORDER BY v.visit_id, e.encounter_datetime, e.encounter_id";
 
+    /**
+     * The beds of every visit that has an Admission and is open or ended since the cut-off, with their type. Only
+     * read when bed types are mapped to products. The bed's current type is used for every night, as a ward's
+     * current tags are.
+     */
+    static final String BEDS_SQL = "SELECT v.uuid AS visit_uuid, a.date_started, a.date_stopped,"
+            + " bt.uuid AS type_uuid, bt.name AS type_name"
+            + " FROM bed_patient_assignment_map a"
+            + " JOIN encounter e ON e.encounter_id = a.encounter_id AND e.voided = 0"
+            + " JOIN visit v ON v.visit_id = e.visit_id"
+            + " JOIN bed b ON b.bed_id = a.bed_id"
+            + " JOIN bed_type bt ON bt.bed_type_id = b.bed_type_id"
+            + " WHERE a.voided = 0 AND v.voided = 0"
+            + " AND (v.date_stopped IS NULL OR v.date_stopped >= ?)"
+            + " ORDER BY v.visit_id, a.date_started";
+
     /** One Admission, Transfer or Discharge encounter. */
     public record AdtEvent(String encounterUuid, int encounterId, String typeUuid, Instant at, String locationUuid) {}
+
+    /**
+     * A bed the patient occupied from {@code start} until {@code stop} (null: still in it), whose type is billed as
+     * {@code product}. Beds whose type is not mapped are left out: their nights take the ward's class.
+     */
+    public record BedAssignment(Instant start, Instant stop, String product) {
+
+        boolean covers(Instant at) {
+            return !start.isAfter(at) && (stop == null || stop.isAfter(at));
+        }
+
+        boolean overlaps(Instant from, Instant to) {
+            return start.isBefore(to) && (stop == null || stop.isAfter(from));
+        }
+    }
 
     /** A visit with an admission, and the nights to bill per product external id (every configured product). */
     public record InpatientStay(
@@ -123,6 +156,13 @@ public class InpatientStayHandler {
     @Value("${eip.inpatient.stay.location.tag.products:}")
     private String locationTagProducts;
 
+    /**
+     * Comma separated {@code bedType=product} pairs; the bed type by name or uuid. A night in a bed of a mapped type
+     * is billed as that product, whatever the ward.
+     */
+    @Value("${eip.inpatient.stay.bed.type.products:}")
+    private String bedTypeProducts;
+
     @Value("${eip.inpatient.stay.admission.encounter.types:}")
     private String admissionEncounterTypes;
 
@@ -151,6 +191,8 @@ public class InpatientStayHandler {
             products.add(defaultProduct.trim());
         }
         products.addAll(parseTagProducts(locationTagProducts).values());
+        products.addAll(parsePairs(bedTypeProducts, "eip.inpatient.stay.bed.type.products", "bedType=product")
+                .values());
         return products;
     }
 
@@ -197,13 +239,22 @@ public class InpatientStayHandler {
                 },
                 args.toArray());
 
+        Map<String, List<BedAssignment>> bedsByVisit = readBeds(now);
         ZoneId zone = ZoneId.of(timezone);
         Set<String> products = getProducts();
         List<InpatientStay> stays = new ArrayList<>();
         for (Map.Entry<String, List<AdtEvent>> entry : eventsByVisit.entrySet()) {
             List<AdtEvent> events = entry.getValue();
             Map<String, Integer> nights = countNights(
-                    events, stopByVisit.get(entry.getKey()), now, zone, minNights, types, productOfLocation, products);
+                    events,
+                    stopByVisit.get(entry.getKey()),
+                    now,
+                    zone,
+                    minNights,
+                    types,
+                    productOfLocation,
+                    bedsByVisit.getOrDefault(entry.getKey(), List.of()),
+                    products);
             String admission = events.stream()
                     .filter(e -> types.admission().contains(e.typeUuid()))
                     .map(AdtEvent::encounterUuid)
@@ -214,12 +265,26 @@ public class InpatientStayHandler {
         return stays;
     }
 
+    /** The nights of one visit per product, by ward class only (no bed is mapped). */
+    public static Map<String, Integer> countNights(
+            List<AdtEvent> events,
+            Instant visitStop,
+            Instant now,
+            ZoneId zone,
+            int minNights,
+            AdtTypes types,
+            Function<String, String> productOfLocation,
+            Set<String> products) {
+        return countNights(events, visitStop, now, zone, minNights, types, productOfLocation, List.of(), products);
+    }
+
     /**
      * The nights of one visit per product. Pure: everything it needs is passed in.
      *
      * @param events the visit's Admission, Transfer and Discharge encounters, in any order
      * @param visitStop when the visit ended, or null if it is open
      * @param productOfLocation the stay product of a ward
+     * @param beds the visit's beds of a mapped type: a midnight in one is billed as its product, not the ward's
      * @param products every stay product, so that a product with no night is present with 0
      */
     public static Map<String, Integer> countNights(
@@ -230,6 +295,7 @@ public class InpatientStayHandler {
             int minNights,
             AdtTypes types,
             Function<String, String> productOfLocation,
+            List<BedAssignment> beds,
             Set<String> products) {
         Map<String, Integer> nights = new LinkedHashMap<>();
         for (String product : products) {
@@ -240,6 +306,8 @@ public class InpatientStayHandler {
         Instant end = visitStop != null && visitStop.isBefore(now) ? visitStop : now;
 
         String admittedProduct = null;
+        Instant admittedAt = null;
+        Instant firstStayEnd = null;
         boolean admitted = false;
         Instant from = null;
         String location = null;
@@ -248,44 +316,100 @@ public class InpatientStayHandler {
             if (types.admission().contains(type)
                     || (admitted && types.transfer().contains(type))) {
                 if (admitted) {
-                    addMidnights(nights, from, event.at(), zone, productOfLocation.apply(location));
+                    addMidnights(nights, from, event.at(), zone, productOfLocation.apply(location), beds);
                 }
                 if (admittedProduct == null) {
                     admittedProduct = productOfLocation.apply(event.locationUuid());
+                    admittedAt = event.at();
                 }
                 admitted = true;
                 from = event.at();
                 location = event.locationUuid();
             } else if (admitted && types.discharge().contains(type)) {
-                addMidnights(nights, from, event.at(), zone, productOfLocation.apply(location));
+                addMidnights(nights, from, event.at(), zone, productOfLocation.apply(location), beds);
+                if (firstStayEnd == null) {
+                    firstStayEnd = event.at();
+                }
                 admitted = false;
             }
         }
         if (admitted) {
-            addMidnights(nights, from, end, zone, productOfLocation.apply(location));
+            addMidnights(nights, from, end, zone, productOfLocation.apply(location), beds);
         }
 
         int total = nights.values().stream().mapToInt(Integer::intValue).sum();
         if (admittedProduct != null && total < minNights) {
-            nights.merge(admittedProduct, minNights - total, Integer::sum);
+            // The bed is assigned with or just after the admission: take the first one of the first stay
+            Instant stayStart = admittedAt;
+            Instant stayEnd = firstStayEnd != null ? firstStayEnd : end;
+            Instant until = stayEnd.isAfter(stayStart) ? stayEnd : stayStart.plusSeconds(1);
+            String product = beds.stream()
+                    .filter(bed -> bed.overlaps(stayStart, until))
+                    .min(Comparator.comparing(BedAssignment::start))
+                    .map(BedAssignment::product)
+                    .orElse(admittedProduct);
+            nights.merge(product, minNights - total, Integer::sum);
         }
         return nights;
     }
 
-    /** Adds to the product every midnight m, in the zone, with from < m <= to. */
-    static void addMidnights(Map<String, Integer> nights, Instant from, Instant to, ZoneId zone, String product) {
-        if (from == null || to == null || !to.isAfter(from) || product == null) {
+    /**
+     * Adds every midnight m, in the zone, with from < m <= to: to the product of the bed occupied at m, else to the
+     * ward's product.
+     */
+    static void addMidnights(
+            Map<String, Integer> nights,
+            Instant from,
+            Instant to,
+            ZoneId zone,
+            String wardProduct,
+            List<BedAssignment> beds) {
+        if (from == null || to == null || !to.isAfter(from)) {
             return;
         }
         ZonedDateTime midnight = from.atZone(zone).toLocalDate().plusDays(1).atStartOfDay(zone);
-        int count = 0;
         while (!midnight.toInstant().isAfter(to)) {
-            count++;
+            Instant at = midnight.toInstant();
+            String product = beds.stream()
+                    .filter(bed -> bed.covers(at))
+                    .max(Comparator.comparing(BedAssignment::start))
+                    .map(BedAssignment::product)
+                    .orElse(wardProduct);
+            if (product != null) {
+                nights.merge(product, 1, Integer::sum);
+            }
             midnight = midnight.plusDays(1).toLocalDate().atStartOfDay(zone);
         }
-        if (count > 0) {
-            nights.merge(product, count, Integer::sum);
+    }
+
+    /** The beds of the visits to bill, by visit, keeping those whose type is mapped to a product. */
+    Map<String, List<BedAssignment>> readBeds(Instant now) {
+        Map<String, String> typeProducts =
+                parsePairs(bedTypeProducts, "eip.inpatient.stay.bed.type.products", "bedType=product");
+        if (typeProducts.isEmpty()) {
+            return Map.of();
         }
+        Map<String, List<BedAssignment>> bedsByVisit = new HashMap<>();
+        jdbcTemplate.query(
+                BEDS_SQL,
+                rs -> {
+                    String product = typeProducts.get(rs.getString("type_uuid"));
+                    if (product == null) {
+                        product = typeProducts.get(rs.getString("type_name"));
+                    }
+                    if (product == null) {
+                        return;
+                    }
+                    Timestamp stopped = rs.getTimestamp("date_stopped");
+                    bedsByVisit
+                            .computeIfAbsent(rs.getString("visit_uuid"), k -> new ArrayList<>())
+                            .add(new BedAssignment(
+                                    rs.getTimestamp("date_started").toInstant(),
+                                    stopped == null ? null : stopped.toInstant(),
+                                    product));
+                },
+                Timestamp.from(now.minus(Duration.ofDays(lookbackDays))));
+        return bedsByVisit;
     }
 
     /** One location: its parent and its tags, by name and by uuid. */
@@ -357,16 +481,20 @@ public class InpatientStayHandler {
     }
 
     static Map<String, String> parseTagProducts(String value) {
-        Map<String, String> tagProducts = new LinkedHashMap<>();
+        return parsePairs(value, "eip.inpatient.stay.location.tag.products", "tag=product");
+    }
+
+    static Map<String, String> parsePairs(String value, String property, String expected) {
+        Map<String, String> pairs = new LinkedHashMap<>();
         for (String pair : parseList(value)) {
             int eq = pair.lastIndexOf('=');
             if (eq <= 0 || eq == pair.length() - 1) {
-                log.warn("Ignoring eip.inpatient.stay.location.tag.products entry '{}': expected tag=product", pair);
+                log.warn("Ignoring {} entry '{}': expected {}", property, pair, expected);
                 continue;
             }
-            tagProducts.put(pair.substring(0, eq).trim(), pair.substring(eq + 1).trim());
+            pairs.put(pair.substring(0, eq).trim(), pair.substring(eq + 1).trim());
         }
-        return tagProducts;
+        return pairs;
     }
 
     static Set<String> parseList(String value) {
