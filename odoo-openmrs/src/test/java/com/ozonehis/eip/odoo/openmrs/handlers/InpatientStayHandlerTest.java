@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.InpatientStayHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.InpatientStayHandler.AdtEvent;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.InpatientStayHandler.AdtTypes;
+import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.InpatientStayHandler.BedAssignment;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.InpatientStayHandler.InpatientStay;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -45,7 +46,9 @@ class InpatientStayHandlerTest {
 
     private static final String VIP = "vip-product";
 
-    private static final Set<String> PRODUCTS = new LinkedHashSet<>(List.of(COMMUNE, VIP));
+    private static final String SEMI_PRIVATE = "semi-private-product";
+
+    private static final Set<String> PRODUCTS = new LinkedHashSet<>(List.of(COMMUNE, VIP, SEMI_PRIVATE));
 
     private static final String WARD = "ward";
 
@@ -76,7 +79,7 @@ class InpatientStayHandlerTest {
                 null,
                 "2026-11-07T10:00:00");
 
-        assertEquals(Map.of(COMMUNE, 1, VIP, 0), nights);
+        assertEquals(Map.of(COMMUNE, 1, VIP, 0, SEMI_PRIVATE, 0), nights);
     }
 
     @Test
@@ -131,7 +134,7 @@ class InpatientStayHandlerTest {
                 null,
                 "2026-11-10T10:00:00");
 
-        assertEquals(Map.of(COMMUNE, 2, VIP, 2), nights);
+        assertEquals(Map.of(COMMUNE, 2, VIP, 2, SEMI_PRIVATE, 0), nights);
     }
 
     @Test
@@ -160,7 +163,7 @@ class InpatientStayHandlerTest {
                 null,
                 "2026-11-07T10:00:00");
 
-        assertEquals(Map.of(COMMUNE, 0, VIP, 1), nights);
+        assertEquals(Map.of(COMMUNE, 0, VIP, 1, SEMI_PRIVATE, 0), nights);
     }
 
     @Test
@@ -174,7 +177,71 @@ class InpatientStayHandlerTest {
                 null,
                 "2026-11-10T10:00:00");
 
-        assertEquals(Map.of(COMMUNE, 1, VIP, 1), nights);
+        assertEquals(Map.of(COMMUNE, 1, VIP, 1, SEMI_PRIVATE, 0), nights);
+    }
+
+    private Map<String, Integer> countWithBeds(
+            List<AdtEvent> events, List<BedAssignment> beds, String visitStop, String now) {
+        return InpatientStayHandler.countNights(
+                events,
+                visitStop == null ? null : utc(visitStop),
+                utc(now),
+                BUJUMBURA,
+                1,
+                TYPES,
+                CLASS_OF,
+                beds,
+                PRODUCTS);
+    }
+
+    private static BedAssignment bed(String start, String stop, String product) {
+        return new BedAssignment(utc(start), stop == null ? null : utc(stop), product);
+    }
+
+    @Test
+    void midnightInABedOfAMappedType_isBilledAsTheBedsClass_notTheWards() {
+        // Shared ward, but a semi-private bed for the midnights of the 6th and 7th
+        Map<String, Integer> nights = countWithBeds(
+                List.of(event(ADMISSION, "2026-11-05T08:00:00", WARD), event(DISCHARGE, "2026-11-08T07:00:00", WARD)),
+                List.of(bed("2026-11-05T08:00:05", "2026-11-07T08:00:00", SEMI_PRIVATE)),
+                null,
+                "2026-11-09T10:00:00");
+
+        // after the bed is left on the 7th, the midnight of the 8th takes the ward's class
+        assertEquals(Map.of(COMMUNE, 1, VIP, 0, SEMI_PRIVATE, 2), nights);
+    }
+
+    @Test
+    void bedClass_winsOverAPrivateRoomTag() {
+        Map<String, Integer> nights = countWithBeds(
+                List.of(event(ADMISSION, "2026-11-05T08:00:00", PRIVATE_ROOM)),
+                List.of(bed("2026-11-05T08:00:00", null, SEMI_PRIVATE)),
+                null,
+                "2026-11-06T23:00:00");
+
+        assertEquals(Map.of(COMMUNE, 0, VIP, 0, SEMI_PRIVATE, 2), nights);
+    }
+
+    @Test
+    void sameDayStay_isOneNightAtTheClassOfItsFirstBed_assignedAfterTheAdmission() {
+        Map<String, Integer> nights = countWithBeds(
+                List.of(event(ADMISSION, "2026-11-05T08:00:00", WARD), event(DISCHARGE, "2026-11-05T15:00:00", WARD)),
+                List.of(bed("2026-11-05T08:00:30", "2026-11-05T15:00:00", VIP)),
+                null,
+                "2026-11-07T10:00:00");
+
+        assertEquals(Map.of(COMMUNE, 0, VIP, 1, SEMI_PRIVATE, 0), nights);
+    }
+
+    @Test
+    void bedOfAnotherStayOfTheVisit_doesNotChangeTheMinimumNight() {
+        Map<String, Integer> nights = countWithBeds(
+                List.of(event(ADMISSION, "2026-11-05T08:00:00", WARD), event(DISCHARGE, "2026-11-05T15:00:00", WARD)),
+                List.of(bed("2026-11-04T08:00:00", "2026-11-04T09:00:00", VIP)),
+                null,
+                "2026-11-07T10:00:00");
+
+        assertEquals(Map.of(COMMUNE, 1, VIP, 0, SEMI_PRIVATE, 0), nights);
     }
 
     @Test
@@ -212,6 +279,10 @@ class InpatientStayHandlerTest {
         jdbc.execute("CREATE TABLE location_tag (location_tag_id INT PRIMARY KEY, uuid VARCHAR(38),"
                 + " name VARCHAR(255), retired TINYINT)");
         jdbc.execute("CREATE TABLE location_tag_map (location_id INT, location_tag_id INT)");
+        jdbc.execute("CREATE TABLE bed_type (bed_type_id INT PRIMARY KEY, uuid VARCHAR(38), name VARCHAR(255))");
+        jdbc.execute("CREATE TABLE bed (bed_id INT PRIMARY KEY, bed_type_id INT)");
+        jdbc.execute("CREATE TABLE bed_patient_assignment_map (id INT PRIMARY KEY, bed_id INT, patient_id INT,"
+                + " encounter_id INT, date_started TIMESTAMP, date_stopped TIMESTAMP, voided TINYINT)");
         jdbc.execute("CREATE TABLE metadatamapping_metadata_term_mapping (id INT PRIMARY KEY, code VARCHAR(255),"
                 + " metadata_uuid VARCHAR(38), retired TINYINT)");
         jdbc.update(
@@ -290,6 +361,40 @@ class InpatientStayHandlerTest {
         List<InpatientStay> stays = handler.getStays(utc("2026-11-05T12:00:00"));
 
         assertEquals(Map.of(COMMUNE, 0, VIP, 1), stays.get(0).nightsByProduct());
+    }
+
+    @Test
+    void getStays_billsEachNightAsTheTypeOfTheBedOccupied() {
+        jdbc.update("INSERT INTO bed_type VALUES (1, 'type-shared', 'Partagé'), (2, 'type-semi', 'Semi-privé'),"
+                + " (3, 'type-unmapped', 'Autre')");
+        jdbc.update("INSERT INTO bed VALUES (1, 1), (2, 2), (3, 3), (4, NULL)");
+        handler.setDefaultProduct(COMMUNE);
+        handler.setBedTypeProducts("type-semi=" + SEMI_PRIVATE + ", Partagé=" + COMMUNE);
+        // A: admitted 5 Nov in the ward, semi-private bed (by uuid) until the 7th at noon, then a bed of an
+        // unmapped type in the private room: the room's tag applies again
+        jdbc.update("INSERT INTO visit VALUES (1, 'visit-a', 100, '2026-11-05 07:00:00', NULL, 0)");
+        jdbc.update("INSERT INTO encounter VALUES (1, 'a-adm', 1, 1, '2026-11-05 08:00:00', 11, 0),"
+                + " (2, 'a-tr', 1, 2, '2026-11-07 10:00:00', 12, 0)");
+        jdbc.update("INSERT INTO bed_patient_assignment_map VALUES"
+                + " (1, 2, 100, 1, '2026-11-05 08:00:10', '2026-11-07 10:00:00', 0),"
+                + " (2, 3, 100, 2, '2026-11-07 10:00:00', NULL, 0),"
+                // voided: ignored
+                + " (3, 1, 100, 2, '2026-11-07 10:00:00', NULL, 1)");
+
+        List<InpatientStay> stays = handler.getStays(utc("2026-11-08T23:00:00"));
+
+        // midnights of the 6th and 7th in the semi-private bed; 8th and 9th in the private room
+        assertEquals(Map.of(COMMUNE, 0, VIP, 2, SEMI_PRIVATE, 2), stays.get(0).nightsByProduct());
+    }
+
+    @Test
+    void getStays_withoutMappedBedTypes_doesNotReadBeds() {
+        jdbc.execute("DROP TABLE bed_patient_assignment_map");
+        handler.setBedTypeProducts("");
+        jdbc.update("INSERT INTO visit VALUES (1, 'visit-a', 100, '2026-11-05 07:00:00', NULL, 0)");
+        jdbc.update("INSERT INTO encounter VALUES (1, 'a-adm', 1, 1, '2026-11-05 08:00:00', 11, 0)");
+
+        assertEquals(1, handler.getStays(utc("2026-11-05T12:00:00")).size());
     }
 
     @Test
