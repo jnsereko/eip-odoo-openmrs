@@ -58,8 +58,10 @@ public class MedicationRequestProcessor implements Processor {
 
     private static final List<String> NOT_DISPENSED_FULFILLER_STATUSES = List.of("ON_HOLD", "DECLINED");
 
+    // Synchronized: the dispense schedule (MedicationDispenseProcessor) sends prescriptions here too, and two
+    // threads must not both create the visit's quotation.
     @Override
-    public void process(Exchange exchange) {
+    public synchronized void process(Exchange exchange) {
         try (ProducerTemplate producerTemplate = exchange.getContext().createProducerTemplate()) {
             Bundle bundle = exchange.getMessage().getBody(Bundle.class);
             List<Bundle.BundleEntryComponent> entries = bundle.getEntry();
@@ -106,13 +108,31 @@ public class MedicationRequestProcessor implements Processor {
                 }
 
                 Partner partner = partnerHandler.createOrUpdatePartner(producerTemplate, patient, companyId);
-                if ("c".equals(eventType) || "u".equals(eventType)) {
+                boolean dispenseSync = Boolean.TRUE.equals(exchange.getMessage()
+                        .getHeader(
+                                com.ozonehis.eip.odoo.openmrs.Constants.HEADER_MEDICATION_DISPENSE_SYNC,
+                                Boolean.class));
+                if (dispenseSync) {
+                    // A dispense of the prescription was recorded, edited or deleted (UVL-EMR#605): its drug line
+                    // follows what is dispensed, whatever the prescription's state
+                    if (!saleOrderHandler.syncDispensedMedicationRequest(
+                            medicationRequest,
+                            encounter,
+                            partner,
+                            encounterVisitUuid,
+                            patient.getIdPart(),
+                            companyId,
+                            producerTemplate)) {
+                        throw new IllegalStateException(
+                                "could not read the prescriptions of its drug in visit " + encounterVisitUuid);
+                    }
+                } else if ("c".equals(eventType) || "u".equals(eventType)) {
                     String fulfillerStatus = getFulfillerStatus(medicationRequest);
                     if (fulfillerStatus != null
                             && NOT_DISPENSED_FULFILLER_STATUSES.contains(fulfillerStatus)
                             && !medicationDispenseHandler.hasDispensedQuantity(medicationRequest.getIdPart())) {
                         // Paused or closed by the pharmacy with nothing dispensed: not billed. If the
-                        // pharmacist dispenses later, the fulfiller status changes again and the line is re-added.
+                        // pharmacist dispenses later, the dispense schedule adds the line again.
                         // A partly dispensed prescription keeps its line, and so does the line of a drug that other
                         // prescriptions of the visit still bill (UVL-EMR#544), with their quantity.
                         if (saleOrderHandler.updateMedicationRequestLineQuantity(

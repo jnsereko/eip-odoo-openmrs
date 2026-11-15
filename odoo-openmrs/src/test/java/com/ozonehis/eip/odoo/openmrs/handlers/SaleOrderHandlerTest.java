@@ -290,7 +290,8 @@ class SaleOrderHandlerTest {
         verify(producerTemplate, times(1)).sendBody("direct:odoo-create-sale-order-line-route", saleOrderLine);
         verify(insurancePayerHandler, times(1))
                 .noteVisitPayerProblem(
-                        Mockito.argThat(order -> order != null && Integer.valueOf(1).equals(order.getOrderId())),
+                        Mockito.argThat(
+                                order -> order != null && Integer.valueOf(1).equals(order.getOrderId())),
                         eq("Assurance privée"));
     }
 
@@ -770,8 +771,8 @@ class SaleOrderHandlerTest {
         mockVisitLinesOfTest(visitLine(6300, 1, 10.0));
         when(orderHandler.getDrugOrdersInVisit("rx-2"))
                 .thenReturn(List.of(stoppedDrugOrder("rx-1", 10f), activeDrugOrder("rx-2", 10f)));
-        when(medicationDispenseHandler.hasDispensedQuantity("rx-1")).thenReturn(true);
-        when(medicationDispenseHandler.getDispensedQuantity("rx-1", "tablet")).thenReturn(10f);
+        dispensed("rx-1", 10f);
+        dispensed("rx-2", 10f);
         ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
 
         // Act
@@ -795,6 +796,8 @@ class SaleOrderHandlerTest {
                 .thenReturn(List.of(
                         new DrugOrderInVisit("rx-1", true, 10f, "tablet", "COMPLETED"),
                         new DrugOrderInVisit("rx-2", true, 10f, "tablet", "COMPLETED")));
+        dispensed("rx-1", 10f);
+        dispensed("rx-2", 10f);
         ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
 
         // Act: the dispense update of the first prescription, after the second was prescribed
@@ -814,6 +817,7 @@ class SaleOrderHandlerTest {
         when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(quotationLine(6300, 10f));
         mockVisitLinesOfTest(visitLine(6300, 1, 10.0));
         when(orderHandler.getDrugOrdersInVisit("rx-1")).thenReturn(List.of(activeDrugOrder("rx-1", 10f)));
+        dispensed("rx-1", 10f);
         ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
 
         // Act
@@ -825,7 +829,7 @@ class SaleOrderHandlerTest {
         Mockito.verifyNoInteractions(producerTemplate);
     }
 
-    // A new quotation for the visit's first prescription is created with the visit's quantity of the drug
+    // A new quotation for the visit's first dispensed prescription is created with the visit's quantity of the drug
     @Test
     public void shouldCreateTheDrugLineWithWhatThePrescriptionsOfTheVisitBill() throws Exception {
         // Setup
@@ -835,6 +839,7 @@ class SaleOrderHandlerTest {
         mockDrugProduct(prescription);
         mockVisitLinesOfTest();
         when(orderHandler.getDrugOrdersInVisit("rx-1")).thenReturn(List.of(activeDrugOrder("rx-1", 10f)));
+        dispensed("rx-1", 10f);
         when(saleOrderMapper.toOdoo(any(Encounter.class))).thenReturn(getSaleOrder());
         mockDraftQuotation(1);
         when(saleOrderLineHandler.buildSaleOrderLineIfProductExists(eq(prescription), any()))
@@ -933,6 +938,7 @@ class SaleOrderHandlerTest {
         when(orderHandler.getDrugOrdersInVisit("rx-2"))
                 .thenReturn(List.of(
                         activeDrugOrder("rx-1", 10f), new DrugOrderInVisit("rx-2", true, 10f, "tablet", "DECLINED")));
+        dispensed("rx-1", 10f);
         when(medicationDispenseHandler.hasDispensedQuantity("rx-2")).thenReturn(false);
         ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
 
@@ -963,7 +969,7 @@ class SaleOrderHandlerTest {
         verify(saleOrderLineHandler, never()).sendSaleOrderLine(any(), any(), any());
     }
 
-    // UVL-EMR #385 unchanged: a syrup prescribed in mL is one bottle, so two prescriptions are two bottles
+    // UVL-EMR #385 unchanged: a syrup prescribed in mL is one bottle, so two prescriptions dispensed are two bottles
     @Test
     public void shouldBillOneContainerPerPrescriptionInAPerContainerUnit() throws Exception {
         // Setup
@@ -977,6 +983,7 @@ class SaleOrderHandlerTest {
                         new DrugOrderInVisit("rx-1", false, 100f, "milliliter", "COMPLETED"),
                         new DrugOrderInVisit("rx-2", true, 60f, "milliliter", null)));
         when(medicationDispenseHandler.hasDispensedQuantity("rx-1")).thenReturn(true);
+        when(medicationDispenseHandler.hasDispensedQuantity("rx-2")).thenReturn(true);
         ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
 
         // Act
@@ -999,6 +1006,7 @@ class SaleOrderHandlerTest {
         mockVisitLinesOfTest(visitLine(6300, 1, 2.0));
         when(orderHandler.getDrugOrdersInVisit("rx-1"))
                 .thenReturn(List.of(new DrugOrderInVisit("rx-1", true, 100f, "milliliter", "COMPLETED")));
+        when(medicationDispenseHandler.hasDispensedQuantity("rx-1")).thenReturn(true);
         ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
 
         // Act
@@ -1020,6 +1028,8 @@ class SaleOrderHandlerTest {
         mockVisitLinesOfTest(visitLine(6300, 1, 10.0));
         when(orderHandler.getDrugOrdersInVisit("rx-2"))
                 .thenReturn(List.of(activeDrugOrder("rx-1", 10f), activeDrugOrder("rx-2", 5f)));
+        dispensed("rx-1", 10f);
+        dispensed("rx-2", 5f);
         SaleOrderLine newLine = new SaleOrderLine();
         when(saleOrderLineHandler.buildSaleOrderLineIfProductExists(repeat, quotation))
                 .thenReturn(newLine);
@@ -1032,6 +1042,235 @@ class SaleOrderHandlerTest {
         // Verify
         verify(producerTemplate, times(1)).sendBody("direct:odoo-create-sale-order-line-route", newLine);
         assertEquals(5f, newLine.getSaleOrderLineProductUomQty());
+    }
+
+    // UVL-EMR #605, M4 gate on UAT 11 Nov 2026: 30 prescribed, 20 given from Box 1, the quote billed 30.
+    // The bill follows what was dispensed (decided 13 Nov 2026).
+    @Test
+    public void shouldBillOnlyWhatWasDispensedOfAPartlyDispensedPrescription() throws Exception {
+        // Setup
+        MedicationRequest prescription = medicationRequest("rx-1");
+        mockDrugProduct(prescription);
+        mockDraftQuotation(1);
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(quotationLine(6300, 30f));
+        mockVisitLinesOfTest(visitLine(6300, 1, 30.0));
+        when(orderHandler.getDrugOrdersInVisit("rx-1")).thenReturn(List.of(activeDrugOrder("rx-1", 30f)));
+        dispensed("rx-1", 20f);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        boolean synced = saleOrderHandler.syncDispensedMedicationRequest(
+                prescription, new Encounter(), partner(), VISIT_ID_1, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        assertTrue(synced);
+        verifyLineQuantity(producerTemplate, 6300, 20f);
+    }
+
+    // The other 10 dispensed later: the line goes to 30
+    @Test
+    public void shouldBillATopUpDispenseWhenItIsDispensed() throws Exception {
+        // Setup
+        MedicationRequest prescription = medicationRequest("rx-1");
+        mockDrugProduct(prescription);
+        mockDraftQuotation(1);
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(quotationLine(6300, 20f));
+        mockVisitLinesOfTest(visitLine(6300, 1, 20.0));
+        when(orderHandler.getDrugOrdersInVisit("rx-1")).thenReturn(List.of(activeDrugOrder("rx-1", 30f)));
+        dispensed("rx-1", 30f);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.syncDispensedMedicationRequest(
+                prescription, new Encounter(), partner(), VISIT_ID_1, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verifyLineQuantity(producerTemplate, 6300, 30f);
+    }
+
+    // The quotation was paid with the first 20; the top-up of 10 goes on a new quotation, the paid one is untouched
+    @Test
+    public void shouldBillOnlyTheTopUpWhenTheFirstDispenseIsOnAConfirmedSaleOrder() throws Exception {
+        // Setup
+        MedicationRequest prescription = medicationRequest("rx-1");
+        mockDrugProduct(prescription);
+        mockVisitLinesOfTest(visitLine(6300, 1, 20.0));
+        when(orderHandler.getDrugOrdersInVisit("rx-1")).thenReturn(List.of(activeDrugOrder("rx-1", 30f)));
+        dispensed("rx-1", 30f);
+        when(saleOrderMapper.toOdoo(any(Encounter.class))).thenReturn(getSaleOrder());
+        SaleOrderLine newLine = new SaleOrderLine();
+        when(saleOrderLineHandler.buildSaleOrderLineIfProductExists(eq(prescription), any()))
+                .thenReturn(newLine);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+        when(odooClient.searchAndRead(
+                        eq(Constants.SALE_ORDER_MODEL),
+                        eq(List.of(asList("client_order_ref", "=", VISIT_ID_1), asList("state", "=", "draft"))),
+                        any()))
+                .thenReturn(new Object[] {})
+                .thenReturn(new Object[] {getSaleOrderMap(2, VISIT_ID_1, "draft", PARTNER_ID)});
+
+        // Act
+        saleOrderHandler.syncDispensedMedicationRequest(
+                prescription, new Encounter(), partner(), VISIT_ID_1, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verify(producerTemplate, times(1)).sendBody("direct:odoo-create-sale-order-line-route", newLine);
+        assertEquals(10f, newLine.getSaleOrderLineProductUomQty());
+    }
+
+    // A prescription not dispensed yet bills nothing: no quotation is created for it
+    @Test
+    public void shouldNotBillAPrescriptionThatIsNotDispensedYet() throws Exception {
+        // Setup
+        MedicationRequest prescription = medicationRequest("rx-1");
+        mockDrugProduct(prescription);
+        mockVisitLinesOfTest();
+        when(orderHandler.getDrugOrdersInVisit("rx-1")).thenReturn(List.of(activeDrugOrder("rx-1", 30f)));
+        when(medicationDispenseHandler.hasDispensedQuantity("rx-1")).thenReturn(false);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.createSaleOrderWithSaleOrderLine(
+                prescription, new Encounter(), partner(), VISIT_ID_1, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderMapper, never()).toOdoo(any());
+        Mockito.verifyNoInteractions(producerTemplate);
+    }
+
+    // The first dispense of the visit's only drug creates the quotation with what was dispensed
+    @Test
+    public void shouldCreateTheQuotationWithWhatWasDispensedOnTheFirstDispense() throws Exception {
+        // Setup
+        MedicationRequest prescription = medicationRequest("rx-1");
+        mockDrugProduct(prescription);
+        mockVisitLinesOfTest();
+        when(orderHandler.getDrugOrdersInVisit("rx-1")).thenReturn(List.of(activeDrugOrder("rx-1", 30f)));
+        dispensed("rx-1", 20f);
+        when(saleOrderMapper.toOdoo(any(Encounter.class))).thenReturn(getSaleOrder());
+        SaleOrderLine newLine = new SaleOrderLine();
+        when(saleOrderLineHandler.buildSaleOrderLineIfProductExists(eq(prescription), any()))
+                .thenReturn(newLine);
+        when(odooClient.searchAndRead(
+                        eq(Constants.SALE_ORDER_MODEL),
+                        eq(List.of(asList("client_order_ref", "=", VISIT_ID_1), asList("state", "=", "draft"))),
+                        any()))
+                .thenReturn(new Object[] {})
+                .thenReturn(new Object[] {getSaleOrderMap(1, VISIT_ID_1, "draft", PARTNER_ID)});
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        boolean synced = saleOrderHandler.syncDispensedMedicationRequest(
+                prescription, new Encounter(), partner(), VISIT_ID_1, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        assertTrue(synced);
+        verify(producerTemplate, times(1))
+                .sendBodyAndHeaders(eq("direct:odoo-create-sale-order-route"), any(SaleOrder.class), any());
+        verify(producerTemplate, times(1)).sendBody("direct:odoo-create-sale-order-line-route", newLine);
+        assertEquals(20f, newLine.getSaleOrderLineProductUomQty());
+    }
+
+    // A dispense edited from 20 to 15 lowers the line: unlike an order update, a dispense is not raise-only
+    @Test
+    public void shouldLowerTheLineWhenADispenseIsEditedDown() throws Exception {
+        // Setup
+        MedicationRequest prescription = medicationRequest("rx-1");
+        mockDrugProduct(prescription);
+        mockDraftQuotation(1);
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(quotationLine(6300, 20f));
+        mockVisitLinesOfTest(visitLine(6300, 1, 20.0));
+        when(orderHandler.getDrugOrdersInVisit("rx-1")).thenReturn(List.of(activeDrugOrder("rx-1", 30f)));
+        dispensed("rx-1", 15f);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.syncDispensedMedicationRequest(
+                prescription, new Encounter(), partner(), VISIT_ID_1, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verifyLineQuantity(producerTemplate, 6300, 15f);
+    }
+
+    // The only dispense deleted (or declined): the line is removed, and the quotation cancelled once empty
+    @Test
+    public void shouldRemoveTheLineWhenNothingIsDispensedAnyMore() throws Exception {
+        // Setup
+        MedicationRequest prescription = medicationRequest("rx-1");
+        mockDrugProduct(prescription);
+        mockDraftQuotation(1);
+        SaleOrderLine line = quotationLine(6300, 20f);
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(line);
+        mockVisitLinesOfTest(visitLine(6300, 1, 20.0));
+        when(orderHandler.getDrugOrdersInVisit("rx-1")).thenReturn(List.of(activeDrugOrder("rx-1", 30f)));
+        when(medicationDispenseHandler.hasDispensedQuantity("rx-1")).thenReturn(false);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.syncDispensedMedicationRequest(
+                prescription, new Encounter(), partner(), VISIT_ID_1, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderLineHandler, times(1))
+                .sendSaleOrderLine(producerTemplate, "direct:odoo-delete-sale-order-line-route", line);
+        verify(producerTemplate, times(1))
+                .sendBodyAndHeaders(eq("direct:odoo-update-sale-order-route"), any(SaleOrder.class), any());
+    }
+
+    // A syrup line the cashier raised to two bottles is not lowered by a dispense of the syrup
+    @Test
+    public void shouldNotLowerAPerContainerLineOnADispense() throws Exception {
+        // Setup
+        MedicationRequest prescription = medicationRequest("rx-1");
+        prescription.getDispenseRequest().getQuantity().setValue(100).setCode("milliliter");
+        mockDrugProduct(prescription);
+        mockDraftQuotation(1);
+        when(saleOrderLineHandler.isPerContainerUom("milliliter")).thenReturn(true);
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(quotationLine(6300, 2f));
+        mockVisitLinesOfTest(visitLine(6300, 1, 2.0));
+        when(orderHandler.getDrugOrdersInVisit("rx-1"))
+                .thenReturn(List.of(new DrugOrderInVisit("rx-1", true, 100f, "milliliter", null)));
+        when(medicationDispenseHandler.hasDispensedQuantity("rx-1")).thenReturn(true);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        saleOrderHandler.syncDispensedMedicationRequest(
+                prescription, new Encounter(), partner(), VISIT_ID_1, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        verify(saleOrderLineHandler, never()).sendSaleOrderLine(any(), any(), any());
+    }
+
+    // OpenMRS could not be asked: nothing changes, and the caller tries again
+    @Test
+    public void shouldAskToTryAgainWhenThePrescriptionsCannotBeRead() throws Exception {
+        // Setup
+        MedicationRequest prescription = medicationRequest("rx-1");
+        mockDrugProduct(prescription);
+        mockDraftQuotation(1);
+        when(orderHandler.getDrugOrdersInVisit("rx-1")).thenThrow(new Exception("OpenMRS down"));
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        // Act
+        boolean synced = saleOrderHandler.syncDispensedMedicationRequest(
+                prescription, new Encounter(), partner(), VISIT_ID_1, PATIENT_ID, null, producerTemplate);
+
+        // Verify
+        assertFalse(synced);
+        verify(saleOrderLineHandler, never()).sendSaleOrderLine(any(), any(), any());
+        Mockito.verifyNoInteractions(producerTemplate);
+    }
+
+    private static Partner partner() {
+        Partner partner = new Partner();
+        partner.setPartnerId(PARTNER_ID);
+        partner.setPartnerExternalId(PATIENT_IDENTIFIER);
+        return partner;
+    }
+
+    private void dispensed(String uuid, float quantity) {
+        when(medicationDispenseHandler.hasDispensedQuantity(uuid)).thenReturn(true);
+        when(medicationDispenseHandler.getDispensedQuantity(uuid, "tablet")).thenReturn(quantity);
     }
 
     private static DrugOrderInVisit activeDrugOrder(String uuid, float quantity) {

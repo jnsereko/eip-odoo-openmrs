@@ -87,9 +87,6 @@ public class SaleOrderHandler {
     // Odoo sale order states that are still a quotation, so their lines may be changed
     private static final List<String> QUOTATION_STATES = List.of("draft", "sent");
 
-    // Fulfiller statuses the dispensing app sets when the pharmacist pauses or closes a prescription
-    private static final List<String> NOT_DISPENSED_FULFILLER_STATUSES = List.of("ON_HOLD", "DECLINED");
-
     public SaleOrder getDraftSaleOrderIfExistsByVisitId(String visitId, Integer companyId) {
         orderDefaultAttributes = asList(
                 "id",
@@ -185,7 +182,8 @@ public class SaleOrderHandler {
                 if (existingLine != null) {
                     // A repeat prescription of a drug already on the quotation (UVL-EMR#544): one line per drug.
                     // Only raised here, so that a quantity the cashier raised by hand (a second bottle) is not
-                    // lowered by the next dispense; a stopped order lowers it (updateMedicationRequestLineQuantity).
+                    // lowered by the next order update; a stopped order lowers it (updateMedicationRequestLineQuantity)
+                    // and so does an edited or deleted dispense (syncDispensedMedicationRequest).
                     setMedicationRequestLineQuantity(
                             medicationRequest, existingLine, medicationRequestQuantity, true, producerTemplate);
                     return;
@@ -653,17 +651,108 @@ public class SaleOrderHandler {
     }
 
     /**
+     * Brings the drug's line on the visit's draft quotation to what the visit's prescriptions of the drug bill,
+     * after a dispense of the given prescription was recorded, edited or deleted (UVL-EMR#605). The dispensing app
+     * changes the prescription itself only when it is dispensed in full, paused or closed, so a partial dispense
+     * reaches billing only this way.
+     *
+     * <p>Unlike an order update, a dispense lowers the line as well as raising it: a dispense edited from 20 to 15
+     * bills 15, a deleted one bills nothing. A line in a per-container unit is only raised, so that a second
+     * bottle the cashier added by hand is kept (UVL-EMR#385). When the drug has no line it is added, on a new
+     * quotation if the visit has no draft one; when nothing of it is left to bill, its line is removed. A
+     * confirmed sale order is never changed.
+     *
+     * @return false when the visit's prescriptions of the drug could not be read, so that the caller tries again
+     */
+    public boolean syncDispensedMedicationRequest(
+            MedicationRequest medicationRequest,
+            Encounter encounter,
+            Partner partner,
+            String encounterVisitUuid,
+            String patientID,
+            Integer companyId,
+            ProducerTemplate producerTemplate) {
+        Product product = productHandler.getProduct(medicationRequest);
+        if (product == null) {
+            log.info(
+                    "MedicationRequest {}: no Odoo product, so its dispense is not billed",
+                    medicationRequest.getIdPart());
+            return true;
+        }
+        SaleOrder saleOrder = getDraftSaleOrderIfExistsByVisitId(encounterVisitUuid, companyId);
+        Float quantity = getMedicationRequestQuantity(
+                medicationRequest,
+                product,
+                saleOrder == null ? null : saleOrder.getOrderId(),
+                encounterVisitUuid,
+                companyId);
+        if (quantity == null) {
+            return false;
+        }
+        SaleOrderLine line = saleOrder == null
+                ? null
+                : saleOrderLineHandler.getSaleOrderLineIfExists(saleOrder.getOrderId(), product.getProductResId());
+        if (line != null) {
+            if (quantity > 0) {
+                setMedicationRequestLineQuantity(
+                        medicationRequest, line, quantity, isPerContainer(medicationRequest), producerTemplate);
+            } else {
+                removeQuotationLine(line, producerTemplate);
+                log.info(
+                        "MedicationRequest {}: nothing of this drug is dispensed and left to bill in visit {}. Removed"
+                                + " line {} from quotation {}.",
+                        medicationRequest.getIdPart(),
+                        encounterVisitUuid,
+                        line.getSaleOrderLineId(),
+                        saleOrder.getOrderId());
+                cancelSaleOrderWhenNoSaleOrderLine(
+                        partner.getPartnerId(), encounterVisitUuid, companyId, producerTemplate);
+            }
+            return true;
+        }
+        if (quantity <= 0) {
+            log.info(
+                    "MedicationRequest {}: nothing of this drug in visit {} is dispensed and left to bill. No line"
+                            + " added.",
+                    medicationRequest.getIdPart(),
+                    encounterVisitUuid);
+            return true;
+        }
+        if (saleOrder != null) {
+            updateSaleOrderIfExistsWithSaleOrderLine(
+                    medicationRequest,
+                    saleOrder,
+                    encounterVisitUuid,
+                    partner.getPartnerId(),
+                    patientID,
+                    companyId,
+                    producerTemplate);
+        } else {
+            createSaleOrderWithSaleOrderLine(
+                    medicationRequest, encounter, partner, encounterVisitUuid, patientID, companyId, producerTemplate);
+        }
+        return true;
+    }
+
+    private boolean isPerContainer(MedicationRequest medicationRequest) {
+        return medicationRequest.hasDispenseRequest()
+                && medicationRequest.getDispenseRequest().hasQuantity()
+                && saleOrderLineHandler.isPerContainerUom(
+                        medicationRequest.getDispenseRequest().getQuantity().getCode());
+    }
+
+    /**
      * The quantity a drug's line on the visit's quotation should carry (UVL-EMR#544), summed over the visit's
      * prescriptions of the drug (see {@link OrderHandler#getDrugOrdersInVisit}), less what the visit's other,
      * non-cancelled sale orders already bill for it:
      *
      * <ul>
-     *   <li>an active prescription bills its quantity to dispense, as a drug line always did, so that it can be
-     *       paid before it is dispensed; paused or closed by the pharmacy with nothing dispensed, it bills nothing
-     *       (UVL-EMR#393)
-     *   <li>a stopped prescription (discontinued or revised) bills what was dispensed against it, nothing if
-     *       nothing was
-     *   <li>a prescription in a per-container unit (odoo.per.container.uoms) bills one container (UVL-EMR#385)
+     *   <li>a prescription bills what was dispensed against it, active or stopped (UVL-EMR#605): 20 dispensed of 30
+     *       prescribed bills 20, and a later dispense of the other 10 raises it to 30. Nothing dispensed yet, or
+     *       paused or closed by the pharmacy with nothing dispensed (UVL-EMR#393), bills nothing
+     *   <li>dispensed in another unit than prescribed, it bills its quantity to dispense
+     *   <li>a prescription in a per-container unit (odoo.per.container.uoms) bills one container once anything
+     *       is dispensed (UVL-EMR#385)
      * </ul>
      *
      * @param quotationId the quotation being changed, which is not subtracted; null when it is yet to be created
@@ -708,19 +797,14 @@ public class SaleOrderHandler {
     }
 
     private float getBilledQuantity(DrugOrderInVisit drugOrder) {
-        boolean perContainer = saleOrderLineHandler.isPerContainerUom(drugOrder.quantityUnits());
-        // A prescription without a quantity was billed as one unit (Odoo's default line quantity)
-        float prescribed = perContainer || drugOrder.quantity() == null ? 1f : drugOrder.quantity();
-        boolean pausedOrClosed = drugOrder.fulfillerStatus() != null
-                && NOT_DISPENSED_FULFILLER_STATUSES.contains(drugOrder.fulfillerStatus());
-        if (drugOrder.active() && !pausedOrClosed) {
-            return prescribed;
-        }
+        // The bill follows what the pharmacy gave, not what was prescribed (UVL-EMR#605, decided 13 Nov 2026)
         if (!medicationDispenseHandler.hasDispensedQuantity(drugOrder.uuid())) {
             return 0;
         }
-        if (drugOrder.active() || perContainer) {
-            // Paused or closed after part of it was dispensed: billed as before (UVL-EMR#386)
+        boolean perContainer = saleOrderLineHandler.isPerContainerUom(drugOrder.quantityUnits());
+        // A prescription without a quantity was billed as one unit (Odoo's default line quantity)
+        float prescribed = perContainer || drugOrder.quantity() == null ? 1f : drugOrder.quantity();
+        if (perContainer) {
             return prescribed;
         }
         float dispensed = medicationDispenseHandler.getDispensedQuantity(drugOrder.uuid(), drugOrder.quantityUnits());
