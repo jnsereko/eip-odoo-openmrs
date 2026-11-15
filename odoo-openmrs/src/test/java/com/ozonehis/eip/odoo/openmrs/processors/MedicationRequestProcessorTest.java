@@ -8,6 +8,7 @@
 package com.ozonehis.eip.odoo.openmrs.processors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
@@ -18,6 +19,7 @@ import static org.mockito.Mockito.when;
 import static org.mockito.MockitoAnnotations.openMocks;
 import static org.openmrs.eip.fhir.Constants.HEADER_FHIR_EVENT_TYPE;
 
+import com.ozonehis.eip.odoo.openmrs.Constants;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.PartnerHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.SaleOrderHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.MedicationDispenseHandler;
@@ -25,6 +27,7 @@ import com.ozonehis.eip.odoo.openmrs.model.Partner;
 import com.ozonehis.eip.odoo.openmrs.model.SaleOrder;
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.camel.CamelExecutionException;
 import org.apache.camel.Exchange;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.CodeType;
@@ -432,6 +435,50 @@ class MedicationRequestProcessorTest extends BaseProcessorTest {
         entries.add(new Bundle.BundleEntryComponent().setResource(new Medication()));
         bundle.setEntry(entries);
         return bundle;
+    }
+
+    // UVL-EMR #605: a dispense of the prescription changed, so its line follows what is dispensed, not its state
+    @Test
+    void shouldSetTheDrugLineToWhatIsDispensedWhenADispenseOfThePrescriptionChanged() {
+        // Arrange
+        Patient patient = new Patient();
+        patient.setId(PATIENT_ID);
+        MedicationRequest medicationRequest = medicationRequestWithFulfillerStatus(null);
+        Exchange exchange = createExchange(medicationRequestBundle(patient, medicationRequest), "u");
+        exchange.getMessage().setHeader(Constants.HEADER_MEDICATION_DISPENSE_SYNC, true);
+        mockPartner(patient);
+        when(saleOrderHandler.syncDispensedMedicationRequest(
+                        eq(medicationRequest), any(), any(), eq(ENCOUNTER_VISIT_ID), eq(PATIENT_ID), any(), any()))
+                .thenReturn(true);
+
+        // Act
+        medicationRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, times(1))
+                .syncDispensedMedicationRequest(
+                        eq(medicationRequest), any(), any(), eq(ENCOUNTER_VISIT_ID), eq(PATIENT_ID), any(), any());
+        verify(saleOrderHandler, never())
+                .updateSaleOrderIfExistsWithSaleOrderLine(any(), any(), any(), any(Integer.class), any(), any(), any());
+        verify(saleOrderHandler, never())
+                .createSaleOrderWithSaleOrderLine(any(), any(), any(), any(), any(), any(), any());
+        verify(saleOrderHandler, never()).removeSaleOrderLineFromQuotation(any(), any(), any(), any());
+    }
+
+    // The prescriptions could not be read: the processor fails, so that the dispense schedule tries again
+    @Test
+    void shouldFailWhenTheDispensedPrescriptionCannotBeBilled() {
+        // Arrange
+        Patient patient = new Patient();
+        MedicationRequest medicationRequest = medicationRequestWithFulfillerStatus(null);
+        Exchange exchange = createExchange(medicationRequestBundle(patient, medicationRequest), "u");
+        exchange.getMessage().setHeader(Constants.HEADER_MEDICATION_DISPENSE_SYNC, true);
+        mockPartner(patient);
+        when(saleOrderHandler.syncDispensedMedicationRequest(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(false);
+
+        // Act and assert
+        assertThrows(CamelExecutionException.class, () -> medicationRequestProcessor.process(exchange));
     }
 
     private void mockPartner(Patient patient) {

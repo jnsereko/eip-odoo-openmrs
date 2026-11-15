@@ -47,6 +47,9 @@ public class Constants {
 
     public static final String HEADER_ENABLE_PATIENT_SYNC = "enable.patient.sync";
 
+    // Set on a MedicationRequest sent again because one of its dispenses changed (UVL-EMR#605)
+    public static final String HEADER_MEDICATION_DISPENSE_SYNC = "medication.dispense.sync";
+
     public static final String FHIR_OPENMRS_SYSTEM_PREFIX = "http://fhir.openmrs.org/";
 
     public static final String FHIR_OPENMRS_EXT_PREFIX = FHIR_OPENMRS_SYSTEM_PREFIX + "ext/";
