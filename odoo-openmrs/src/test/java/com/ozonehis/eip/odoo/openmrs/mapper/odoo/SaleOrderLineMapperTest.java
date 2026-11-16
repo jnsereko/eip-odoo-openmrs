@@ -165,6 +165,35 @@ class SaleOrderLineMapperTest {
     }
 
     @Test
+    public void shouldUseTheConfiguredOrdererLabel() {
+        org.springframework.test.util.ReflectionTestUtils.setField(saleOrderLineMapper, "ordererLabel", "Prescripteur :");
+
+        assertEquals(" | Prescripteur : John Doe", saleOrderLineMapper.ordererText("John Doe"));
+
+        ServiceRequest serviceRequest = new ServiceRequest();
+        serviceRequest.setCode(new CodeableConcept().setText(COMPLETE_BLOOD_COUNT_DISPLAY));
+        serviceRequest.setRequester(new Reference().setDisplay("John Doe"));
+        assertEquals(
+                COMPLETE_BLOOD_COUNT_DISPLAY + " | Prescripteur : John Doe",
+                saleOrderLineMapper.toOdoo(serviceRequest).getSaleOrderLineName());
+
+        SupplyRequest supplyRequest = new SupplyRequest();
+        supplyRequest.setItem(new Reference().setDisplay(ADHESIVE_DISPLAY));
+        supplyRequest.setRequester(new Reference().setDisplay("John Doe"));
+        assertEquals(
+                ADHESIVE_DISPLAY + " | Prescripteur : John Doe",
+                saleOrderLineMapper.toOdoo(supplyRequest).getSaleOrderLineName());
+    }
+
+    @Test
+    public void shouldKeepTheEnglishOrdererLabelWhenNoneIsConfigured() {
+        assertEquals(" | Orderer: John Doe", saleOrderLineMapper.ordererText("John Doe"));
+
+        org.springframework.test.util.ReflectionTestUtils.setField(saleOrderLineMapper, "ordererLabel", " ");
+        assertEquals(" | Orderer: John Doe", saleOrderLineMapper.ordererText("John Doe"));
+    }
+
+    @Test
     public void shouldMapSupplyRequestToSaleOrderLine() {
         // setup
         SupplyRequest supplyRequest = new SupplyRequest();

@@ -33,6 +33,13 @@ public class SaleOrderLineMapper<R extends Resource> implements ToOdooMapping<R,
     @Value("${odoo.duration.unit.labels:}")
     private String durationUnitLabels;
 
+    /**
+     * The label before the prescriber's name in the line text, e.g. {@code Prescripteur :} on a French site. Empty
+     * keeps {@code Orderer:}.
+     */
+    @Value("${odoo.orderer.label:}")
+    private String ordererLabel;
+
     @Override
     public SaleOrderLine toOdoo(R resource) {
         SaleOrderLine saleOrderLine = new SaleOrderLine();
@@ -40,7 +47,7 @@ public class SaleOrderLineMapper<R extends Resource> implements ToOdooMapping<R,
             saleOrderLine.setSaleOrderLineProductUomQty(1.0f); // default quantity is 1 for serviceRequests.
             String requesterDisplay = serviceRequest.getRequester().getDisplay();
             String serviceDisplay = serviceRequest.getCode().getText();
-            saleOrderLine.setSaleOrderLineName(serviceDisplay + " | Orderer: " + requesterDisplay);
+            saleOrderLine.setSaleOrderLineName(serviceDisplay + ordererText(requesterDisplay));
 
         } else if (resource instanceof MedicationRequest medicationRequest) {
             if (medicationRequest.hasDispenseRequest()) {
@@ -56,7 +63,7 @@ public class SaleOrderLineMapper<R extends Resource> implements ToOdooMapping<R,
             String medicationDisplay =
                     medicationRequest.getMedicationReference().getDisplay();
             saleOrderLine.setSaleOrderLineName(medicationDisplay + " | "
-                    + constructDosageInstructionsText(medicationRequest) + " | Orderer: " + requesterDisplay);
+                    + constructDosageInstructionsText(medicationRequest) + ordererText(requesterDisplay));
 
         } else if (resource instanceof SupplyRequest supplyRequest) {
             log.info("In SaleOrderLineMapper {}", supplyRequest.getQuantity());
@@ -70,7 +77,7 @@ public class SaleOrderLineMapper<R extends Resource> implements ToOdooMapping<R,
             String requesterDisplay = supplyRequest.getRequester().getDisplay();
             Reference supplyRequestReference = (Reference) supplyRequest.getItem();
             String supplyRequestDisplay = supplyRequestReference.getDisplay();
-            saleOrderLine.setSaleOrderLineName(supplyRequestDisplay + " | Orderer: " + requesterDisplay);
+            saleOrderLine.setSaleOrderLineName(supplyRequestDisplay + ordererText(requesterDisplay));
         } else {
             throw new IllegalArgumentException("Sale Order Mapper Unsupported resource type: "
                     + resource.getClass().getName());
@@ -123,6 +130,11 @@ public class SaleOrderLineMapper<R extends Resource> implements ToOdooMapping<R,
         appendWithConditionalHyphen(dosageInstructions, dosage.getText());
 
         return dosageInstructions.toString();
+    }
+
+    String ordererText(String requesterDisplay) {
+        String label = ordererLabel == null || ordererLabel.isBlank() ? "Orderer:" : ordererLabel.trim();
+        return " | " + label + " " + requesterDisplay;
     }
 
     String durationLabel(Timing.UnitsOfTime unit, java.math.BigDecimal duration) {
