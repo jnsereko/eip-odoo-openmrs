@@ -8,6 +8,7 @@
 package com.ozonehis.eip.odoo.openmrs.client;
 
 import static java.util.Arrays.asList;
+import static java.util.Collections.emptyList;
 import static java.util.Collections.emptyMap;
 import static java.util.Collections.singletonList;
 import static java.util.Collections.singletonMap;
@@ -16,6 +17,7 @@ import com.ozonehis.eip.odoo.openmrs.Constants;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import lombok.Getter;
@@ -46,6 +48,12 @@ public class OdooClient {
     private String password;
 
     private Integer uid;
+
+    /**
+     * The Odoo user's context (its language only), sent on every call so that Odoo reads translatable fields such as
+     * a model's name in that language. Empty when it could not be read: calls then go without a context, as before.
+     */
+    private Map<String, Object> userContext;
 
     private XmlRpcClientConfigImpl xmlRpcClientConfig;
 
@@ -92,6 +100,44 @@ public class OdooClient {
                 throw new RuntimeException("Cannot authenticate to Odoo server", e);
             }
         }
+        if (userContext == null) {
+            userContext = readUserContext();
+        }
+    }
+
+    /**
+     * Without a context Odoo reads translatable fields in English while {@code _()} uses the user's language, so the
+     * chatter mixes both (« Sales Order créé »). Reads the user's language once with {@code res.users.context_get}.
+     */
+    private Map<String, Object> readUserContext() {
+        try {
+            Object result = client.execute(
+                    "execute_kw",
+                    asList(getDatabase(), uid, getPassword(), Constants.USER_MODEL, "context_get", emptyList()));
+            if (result instanceof Map<?, ?> context && context.get("lang") instanceof String lang && !lang.isBlank()) {
+                return singletonMap("lang", lang);
+            }
+            log.warn("Odoo user context has no language, calls to Odoo are sent without a context");
+        } catch (XmlRpcException | RuntimeException e) {
+            log.warn("Cannot read the Odoo user's language, calls to Odoo are sent without a context", e);
+        }
+        return emptyMap();
+    }
+
+    private Map<String, Object> kwargs(Map<String, Object> kwargs) {
+        Map<String, Object> result = new HashMap<>(kwargs);
+        if (!userContext.isEmpty()) {
+            result.put("context", userContext);
+        }
+        return result;
+    }
+
+    private List<Object> withKwargs(List<Object> params, Map<String, Object> kwargs) {
+        Map<String, Object> merged = kwargs(kwargs);
+        if (!merged.isEmpty()) {
+            params.add(merged);
+        }
+        return params;
     }
 
     public Integer create(String model, List<Map<String, Object>> dataParams) {
@@ -100,7 +146,10 @@ public class OdooClient {
         try {
             return (Integer) client.execute(
                     "execute_kw",
-                    asList(getDatabase(), uid, getPassword(), model, Constants.CREATE_METHOD, dataParams));
+                    withKwargs(
+                            new ArrayList<>(asList(
+                                    getDatabase(), uid, getPassword(), model, Constants.CREATE_METHOD, dataParams)),
+                            emptyMap()));
         } catch (XmlRpcException e) {
             throw new RuntimeException("Error occurred while creating in odoo server error", e);
         }
@@ -111,7 +160,11 @@ public class OdooClient {
 
         try {
             return (Boolean) client.execute(
-                    "execute_kw", asList(getDatabase(), uid, getPassword(), model, Constants.WRITE_METHOD, dataParams));
+                    "execute_kw",
+                    withKwargs(
+                            new ArrayList<>(asList(
+                                    getDatabase(), uid, getPassword(), model, Constants.WRITE_METHOD, dataParams)),
+                            emptyMap()));
         } catch (XmlRpcException e) {
             throw new RuntimeException("Error occurred while writing to odoo server error", e);
         }
@@ -123,7 +176,10 @@ public class OdooClient {
         try {
             return (Boolean) client.execute(
                     "execute_kw",
-                    asList(getDatabase(), uid, getPassword(), model, Constants.UNLINK_METHOD, dataParams));
+                    withKwargs(
+                            new ArrayList<>(asList(
+                                    getDatabase(), uid, getPassword(), model, Constants.UNLINK_METHOD, dataParams)),
+                            emptyMap()));
         } catch (XmlRpcException e) {
             throw new RuntimeException("Error occurred while deleting from odoo server error", e);
         }
@@ -140,11 +196,12 @@ public class OdooClient {
             params.add(model);
             params.add(Constants.SEARCH_READ_METHOD);
             params.add(singletonList(criteria));
+            Map<String, Object> kwargs = new HashMap<>();
             if (fields != null) {
-                params.add(singletonMap("fields", fields));
+                kwargs.put("fields", fields);
             }
 
-            return (Object[]) client.execute("execute_kw", params);
+            return (Object[]) client.execute("execute_kw", withKwargs(params, kwargs));
         } catch (XmlRpcException e) {
             throw new RuntimeException("Error occurred while searchAndRead from odoo server error", e);
         }
@@ -156,13 +213,15 @@ public class OdooClient {
         try {
             return (Object[]) client.execute(
                     "execute_kw",
-                    asList(
-                            getDatabase(),
-                            uid,
-                            getPassword(),
-                            model,
-                            Constants.SEARCH_METHOD,
-                            singletonList(singletonList(criteria))));
+                    withKwargs(
+                            new ArrayList<>(asList(
+                                    getDatabase(),
+                                    uid,
+                                    getPassword(),
+                                    model,
+                                    Constants.SEARCH_METHOD,
+                                    singletonList(singletonList(criteria)))),
+                            emptyMap()));
         } catch (XmlRpcException e) {
             throw new RuntimeException("Error occurred while searching from odoo server error", e);
         }
