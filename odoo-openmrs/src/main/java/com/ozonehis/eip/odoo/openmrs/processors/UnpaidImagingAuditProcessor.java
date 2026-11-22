@@ -9,6 +9,7 @@ package com.ozonehis.eip.odoo.openmrs.processors;
 
 import ca.uhn.fhir.rest.client.api.IGenericClient;
 import com.ozonehis.eip.odoo.openmrs.RadiologyConcepts;
+import com.ozonehis.eip.odoo.openmrs.RadiologyOrderSearch;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.RadiologyPaymentEvidenceHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.EncounterHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.TaskHandler;
@@ -16,6 +17,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.camel.Exchange;
@@ -139,12 +141,16 @@ public class UnpaidImagingAuditProcessor implements Processor {
                 .minusDays(LOOKBACK_DAYS)
                 .format(DateTimeFormatter.ISO_INSTANT);
 
-        Bundle bundle = openmrsFhirClient
-                .search()
-                .forResource(ServiceRequest.class)
-                .where(new ca.uhn.fhir.rest.gclient.DateClientParam("_lastUpdated").after().second(since))
-                .returnBundle(Bundle.class)
-                .execute();
+        // Radiology orders only, asked of the server: the unfiltered week took 17s on UAT and timed
+        // out (UVL-EMR#876). See RadiologyOrderSearch.
+        List<ServiceRequest> serviceRequests;
+        try {
+            serviceRequests = RadiologyOrderSearch.find(openmrsFhirClient, radiologyConcepts, since);
+        } catch (Exception e) {
+            log.warn("Could not search for completed radiology exams this run ({}).",
+                    RadiologyOrderSearch.describe(e));
+            serviceRequests = null;
+        }
 
         try {
             exchange.getMessage().setHeader("acceptedWithoutPaymentCount", auditAcceptedTasks());
@@ -153,16 +159,12 @@ public class UnpaidImagingAuditProcessor implements Processor {
             log.warn("Could not audit accepted radiology Tasks this run: {}", e.getMessage());
         }
 
-        if (bundle == null) {
+        if (serviceRequests == null) {
             return;
         }
 
         int unpaid = 0;
-        for (Bundle.BundleEntryComponent entry : bundle.getEntry()) {
-            if (!(entry.getResource() instanceof ServiceRequest)) {
-                continue;
-            }
-            ServiceRequest serviceRequest = (ServiceRequest) entry.getResource();
+        for (ServiceRequest serviceRequest : serviceRequests) {
 
             // Only finished work. An order still ACTIVE and unpaid is the normal waiting state and
             // is exactly what the payment processor is for -- reporting it here would drown the

@@ -22,6 +22,7 @@ import ca.uhn.fhir.rest.gclient.ICriterion;
 import ca.uhn.fhir.rest.gclient.IQuery;
 import ca.uhn.fhir.rest.gclient.IUntypedQuery;
 import com.ozonehis.eip.odoo.openmrs.FakeOdoo;
+import com.ozonehis.eip.odoo.openmrs.FakeServiceRequestSearch;
 import com.ozonehis.eip.odoo.openmrs.RadiologyConcepts;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.RadiologyPaymentEvidenceHandler;
@@ -59,7 +60,7 @@ class RadiologyPaymentTaskProcessorTest {
 
     private FakeOdoo odoo;
 
-    private IQuery<Bundle> srQuery;
+    private FakeServiceRequestSearch server;
 
     private TaskHandler taskHandler;
 
@@ -72,17 +73,10 @@ class RadiologyPaymentTaskProcessorTest {
     @BeforeEach
     @SuppressWarnings({"unchecked", "rawtypes"})
     void setup() {
-        IGenericClient fhirClient = mock(IGenericClient.class);
-        IUntypedQuery<IBaseBundle> untyped = mock(IUntypedQuery.class);
-        IQuery<IBaseBundle> query = mock(IQuery.class);
-        srQuery = mock(IQuery.class);
-        when(fhirClient.search()).thenReturn((IUntypedQuery) untyped);
-        when(untyped.forResource(ServiceRequest.class)).thenReturn(query);
-        when(query.where(any(ICriterion.class))).thenReturn(query);
-        when(query.returnBundle(Bundle.class)).thenReturn(srQuery);
-        Bundle bundle = new Bundle();
-        bundle.addEntry().setResource(serviceRequest(RadiologyConcepts.DEFAULT_UUIDS.iterator().next(), PROCEDURE));
-        when(srQuery.execute()).thenReturn(bundle);
+        server = new FakeServiceRequestSearch();
+        IGenericClient fhirClient = server.client;
+        server.firstPage = asked ->
+                FakeServiceRequestSearch.bundleOf(false, serviceRequest(RadiologyConcepts.DEFAULT_UUIDS.iterator().next(), PROCEDURE));
 
         task = new Task();
         task.setId("5f38de0a-2503-4dcf-9147-4fc20665a0cb");
@@ -189,9 +183,7 @@ class RadiologyPaymentTaskProcessorTest {
     @Test
     void paidUltrasoundOrderIsAccepted() {
         String ultrasound = "EC01 - Abdominal ultrasound";
-        Bundle bundle = new Bundle();
-        bundle.addEntry().setResource(serviceRequest(EC01, ultrasound));
-        when(srQuery.execute()).thenReturn(bundle);
+        server.firstPage = asked -> FakeServiceRequestSearch.bundleOf(false, serviceRequest(EC01, ultrasound));
         odoo.line(6200, 1, ultrasound, 1, "2026-09-10 08:00:05");
         odoo.paidInvoice(9, "INV/2026/09/0009", 6200);
 
@@ -242,15 +234,102 @@ class RadiologyPaymentTaskProcessorTest {
         odoo.unpaidInvoice(9, "INV/2026/09/0009", 1.0, 6200);
         poll();
 
-        when(srQuery.execute()).thenReturn(new Bundle());
+        server.firstPage = asked -> new Bundle();
         poll();
         assertTrue(processor.getAwaitingPayment().isEmpty());
 
-        Bundle back = new Bundle();
-        back.addEntry().setResource(serviceRequest(RadiologyConcepts.DEFAULT_UUIDS.iterator().next(), PROCEDURE));
-        when(srQuery.execute()).thenReturn(back);
+        server.firstPage = asked -> FakeServiceRequestSearch.bundleOf(false, serviceRequest(RadiologyConcepts.DEFAULT_UUIDS.iterator().next(), PROCEDURE));
         poll();
 
         verify(encounterHandler, times(2)).getEncounterByEncounterID(ENCOUNTER);
+    }
+
+    /** UVL-EMR#876: the search carries the radiology concepts and the seven-day window, nothing else. */
+    @Test
+    void searchAsksForTheRadiologyConceptsWithinTheWindow() {
+        poll();
+
+        assertTrue(server.searches.size() >= 1);
+        java.util.Set<String> sent = new java.util.HashSet<>();
+        for (java.util.Map<String, String> asked : server.searches) {
+            sent.addAll(java.util.Arrays.asList(asked.get("code").split(",")));
+            assertTrue(asked.get("_lastUpdated").startsWith("gt"));
+        }
+        assertEquals(RadiologyConcepts.DEFAULT_UUIDS, sent);
+        java.time.Instant since = java.time.Instant.parse(server.searches.get(0).get("_lastUpdated").substring(2));
+        assertTrue(java.time.Duration.between(since, java.time.Instant.now())
+                        .minus(java.time.Duration.ofDays(7))
+                        .abs()
+                        .toMinutes() < 2);
+    }
+
+    /** The server's filter is trusted to narrow, not to decide: an order outside the list is ignored. */
+    @Test
+    void orderOutsideTheRadiologyListIsIgnored() {
+        server.firstPage = asked -> FakeServiceRequestSearch.bundleOf(
+                false, serviceRequest("6d792222-d3e8-4b1e-a1b3-7af9bd7b0f2a", "BI07 - Hemoglobine"));
+
+        poll();
+
+        verify(taskHandler, never()).getTaskByServiceRequestId(any());
+        assertTrue(processor.getAwaitingPayment().isEmpty());
+    }
+
+    /** UVL-EMR#876: a week of orders arrives in pages, and an order on a later page is still released. */
+    @Test
+    void orderOnALaterPageIsReleased() {
+        Bundle first = FakeServiceRequestSearch.bundleOf(true);
+        Bundle second = FakeServiceRequestSearch.bundleOf(
+                false, serviceRequest(RadiologyConcepts.DEFAULT_UUIDS.iterator().next(), PROCEDURE));
+        server.nextPages.put(first, second);
+        server.firstPage = asked -> first;
+        odoo.line(6200, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.paidInvoice(9, "INV/2026/09/0009", 6200);
+
+        poll();
+
+        verify(taskHandler).updateTaskStatus(task, Task.TaskStatus.ACCEPTED);
+    }
+
+    /** The requirement behind the seven-day window: an order placed days ago and paid today is released. */
+    @Test
+    void orderPlacedDaysAgoAndPaidTodayIsReleased() {
+        Date fiveDaysAgo = Date.from(java.time.Instant.now().minus(java.time.Duration.ofDays(5)));
+        ServiceRequest old = serviceRequest(RadiologyConcepts.DEFAULT_UUIDS.iterator().next(), PROCEDURE);
+        old.getMeta().setLastUpdated(fiveDaysAgo);
+        old.setAuthoredOn(fiveDaysAgo);
+        server.firstPage = asked -> FakeServiceRequestSearch.bundleOf(false, old);
+        String authored = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+                .withZone(java.time.ZoneOffset.UTC)
+                .format(fiveDaysAgo.toInstant().plusSeconds(5));
+        odoo.line(6200, 1, PROCEDURE, 1, authored);
+        odoo.paidInvoice(9, "INV/2026/09/0009", 6200);
+
+        poll();
+
+        verify(taskHandler).updateTaskStatus(task, Task.TaskStatus.ACCEPTED);
+    }
+
+    /**
+     * UVL-EMR#876: a search that fails (here a read timeout) skips the cycle without throwing and without
+     * dropping what is being watched - an empty answer would have reported every watched order as having
+     * left the window.
+     */
+    @Test
+    void failedSearchSkipsTheCycleAndKeepsWhatIsWatched() {
+        odoo.line(6200, 1, PROCEDURE, 1, "2026-09-10 08:00:05");
+        odoo.unpaidInvoice(9, "INV/2026/09/0009", 1.0, 6200);
+        poll();
+        assertEquals(Set.of(SR_ID), processor.getAwaitingPayment());
+
+        server.firstPage = asked -> {
+            throw new ca.uhn.fhir.rest.client.exceptions.FhirClientConnectionException(
+                    "HAPI-1361", new java.net.SocketTimeoutException("Read timed out"));
+        };
+        Exchange exchange = new DefaultExchange(new DefaultCamelContext());
+        processor.process(exchange);
+
+        assertEquals(Set.of(SR_ID), processor.getAwaitingPayment());
+        assertEquals(Boolean.TRUE, exchange.getProperty(Exchange.ROUTE_STOP));
     }
 }
