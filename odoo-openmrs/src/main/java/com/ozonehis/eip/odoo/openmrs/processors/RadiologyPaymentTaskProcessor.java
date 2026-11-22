@@ -10,6 +10,7 @@ package com.ozonehis.eip.odoo.openmrs.processors;
 import ca.uhn.fhir.rest.client.api.IGenericClient;
 import com.ozonehis.eip.odoo.openmrs.Constants;
 import com.ozonehis.eip.odoo.openmrs.RadiologyConcepts;
+import com.ozonehis.eip.odoo.openmrs.RadiologyOrderSearch;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
 import com.ozonehis.eip.odoo.openmrs.handlers.odoo.RadiologyPaymentEvidenceHandler;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.EncounterHandler;
@@ -32,7 +33,6 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import org.apache.camel.Processor;
-import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.ServiceRequest;
 import org.hl7.fhir.r4.model.Task;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -130,41 +130,41 @@ public class RadiologyPaymentTaskProcessor implements Processor {
 
     @Override
     public void process(Exchange exchange) {
-        // Bounded by _lastUpdated. The unfiltered search this replaces asked OpenMRS for EVERY
-        // ServiceRequest on every 30s poll: on UAT that is 818 records and 1.5MB, and it takes
-        // ~38 SECONDS to answer - so the HAPI client hit its socket read timeout and the
-        // processor never completed a single cycle. Measured on the same server:
+        // Bounded by _lastUpdated AND by the radiology concepts. The unfiltered search asked OpenMRS
+        // for EVERY ServiceRequest on every 30s poll: on UAT that was 818 records and 1.5MB, ~38
+        // SECONDS, so the HAPI client hit its socket read timeout and no cycle ever completed.
+        // Bounding by _lastUpdated alone cured that until a week held ~600 orders, laboratory
+        // included (UVL-EMR#876: 17s, timed out again). Measured on UAT, same seven-day window:
         //
-        //     no filter                     37.7s   818 records
-        //     _lastUpdated=gt<window>         0.10s     1 record
+        //     _lastUpdated                    17.3s   570 records
+        //     _lastUpdated + code=<radiology>  0.19s     6 records
         //
         // Filtering on status would be the natural thing to do and is not possible: OpenMRS's
         // FHIR2 module rejects `status` as a search parameter with HTTP 400, which is why the
-        // status check below stays client-side.
+        // status check below stays client-side - as does the concept check, in case FHIR2 ever
+        // drops the `code` filter silently.
         String since = ZonedDateTime.now(ZoneOffset.UTC)
                 .minusDays(LOOKBACK_DAYS)
                 .format(DateTimeFormatter.ISO_INSTANT);
 
-        Bundle bundle = openmrsFhirClient
-                .search()
-                .forResource(ServiceRequest.class)
-                .where(new ca.uhn.fhir.rest.gclient.DateClientParam("_lastUpdated").after().second(since))
-                .returnBundle(Bundle.class)
-                .execute();
-
-        if (bundle == null) {
-            log.debug("ServiceRequest search returned no bundle");
+        List<ServiceRequest> serviceRequests;
+        try {
+            serviceRequests = RadiologyOrderSearch.find(openmrsFhirClient, radiologyConcepts, since);
+        } catch (Exception e) {
+            // Nothing is changed and the awaiting-payment bookkeeping is left alone: treating a failed
+            // search as "no orders" would report every watched order as having left the window.
+            log.warn(
+                    "Radiology payment poll skipped: the ServiceRequest search failed ({}). Retrying on the"
+                            + " next poll.",
+                    RadiologyOrderSearch.describe(e));
+            exchange.setProperty(Exchange.ROUTE_STOP, Boolean.TRUE);
             return;
         }
-        log.debug("ServiceRequest search returned {} entries", bundle.getEntry().size());
+        log.debug("ServiceRequest search returned {} entries", serviceRequests.size());
 
         Set<String> inWindow = new HashSet<>();
         Map<String, Instant> stillAwaiting = new LinkedHashMap<>();
-        for (Bundle.BundleEntryComponent entry : bundle.getEntry()) {
-            if (!(entry.getResource() instanceof ServiceRequest)) {
-                continue;
-            }
-            ServiceRequest serviceRequest = (ServiceRequest) entry.getResource();
+        for (ServiceRequest serviceRequest : serviceRequests) {
             String serviceRequestId = serviceRequest.getIdElement().getIdPart();
             inWindow.add(serviceRequestId);
             log.debug("ServiceRequest {} status={}", serviceRequestId, serviceRequest.getStatus());
