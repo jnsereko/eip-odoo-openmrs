@@ -36,6 +36,12 @@ public class MedicationDispenseHandler {
             + " WHERE o.voided = 0 AND (md.date_created >= ? OR md.date_changed >= ? OR md.date_voided >= ?)"
             + " ORDER BY md.medication_dispense_id";
 
+    // The visit and the drug of a prescription, for the note left when it could not be billed (UVL-EMR#939)
+    static final String ORDER_VISIT_SQL = "SELECT v.uuid AS visit_uuid, COALESCE(d.name, dro.drug_non_coded, o.uuid)"
+            + " AS drug_name FROM orders o JOIN drug_order dro ON dro.order_id = o.order_id"
+            + " JOIN encounter e ON e.encounter_id = o.encounter_id JOIN visit v ON v.visit_id = e.visit_id"
+            + " LEFT JOIN drug d ON d.drug_id = dro.drug_inventory_id WHERE o.uuid = ?";
+
     @Autowired
     private IGenericClient openmrsFhirClient;
 
@@ -52,6 +58,18 @@ public class MedicationDispenseHandler {
      * @param changed when it was created, last edited or deleted, whichever is latest, on the database's clock
      */
     public record DispenseChange(String dispenseUuid, String orderUuid, Instant changed) {}
+
+    /** The visit a prescription was written in, and the name of its drug. */
+    public record OrderVisit(String visitUuid, String drugName) {}
+
+    /** The visit and drug of a prescription; null when it has no visit. */
+    public OrderVisit getVisitOfOrder(String orderUuid) {
+        List<OrderVisit> found = jdbcTemplate.query(
+                ORDER_VISIT_SQL,
+                (rs, rowNum) -> new OrderVisit(rs.getString("visit_uuid"), rs.getString("drug_name")),
+                orderUuid);
+        return found.isEmpty() ? null : found.get(0);
+    }
 
     /** The database's clock, which the dispenses' dates are on. */
     public Instant getDatabaseNow() {

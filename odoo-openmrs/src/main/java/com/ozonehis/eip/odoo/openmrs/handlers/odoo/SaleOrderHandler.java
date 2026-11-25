@@ -87,6 +87,25 @@ public class SaleOrderHandler {
     // Odoo sale order states that are still a quotation, so their lines may be changed
     private static final List<String> QUOTATION_STATES = List.of("draft", "sent");
 
+    /**
+     * Posts a note on the visit's draft quotation (UVL-EMR#939).
+     *
+     * @return false when the visit has no draft quotation (nothing is created for it)
+     */
+    public boolean postNoteOnDraftSaleOrder(String visitId, String note) {
+        SaleOrder saleOrder = getDraftSaleOrderIfExistsByVisitId(visitId, null);
+        if (saleOrder == null) {
+            return false;
+        }
+        Map<String, Object> message = new HashMap<>();
+        message.put("model", Constants.SALE_ORDER_MODEL);
+        message.put("res_id", saleOrder.getOrderId());
+        message.put("message_type", "comment");
+        message.put("body", note);
+        odooClient.create("mail.message", List.of(message));
+        return true;
+    }
+
     public SaleOrder getDraftSaleOrderIfExistsByVisitId(String visitId, Integer companyId) {
         orderDefaultAttributes = asList(
                 "id",

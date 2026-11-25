@@ -44,7 +44,8 @@ class RadiologyOrderSearchTest {
         RadiologyOrderSearch.find(server.client, new RadiologyConcepts("e3dea2c8-62c6-4487-bdaa-1d009642f7ad"), SINCE);
 
         assertEquals(1, server.searches.size());
-        assertEquals("e3dea2c8-62c6-4487-bdaa-1d009642f7ad", server.searches.get(0).get("code"));
+        assertEquals(
+                "e3dea2c8-62c6-4487-bdaa-1d009642f7ad", server.searches.get(0).get("code"));
         assertEquals("gt" + SINCE, server.searches.get(0).get("_lastUpdated"));
         assertEquals(List.of(RadiologyOrderSearch.PAGE_SIZE), server.pageSizes);
     }
@@ -61,8 +62,8 @@ class RadiologyOrderSearchTest {
                 .flatMap(asked -> Arrays.stream(asked.get("code").split(",")))
                 .collect(Collectors.toSet());
         assertEquals(concepts.getUuids(), sent);
-        server.searches.forEach(asked ->
-                assertTrue(asked.get("code").split(",").length <= RadiologyOrderSearch.CODES_PER_SEARCH));
+        server.searches.forEach(
+                asked -> assertTrue(asked.get("code").split(",").length <= RadiologyOrderSearch.CODES_PER_SEARCH));
     }
 
     @Test
@@ -74,7 +75,8 @@ class RadiologyOrderSearchTest {
         server.nextPages.put(second, third);
         server.firstPage = asked -> first;
 
-        List<ServiceRequest> found = RadiologyOrderSearch.find(server.client, new RadiologyConcepts("e3dea2c8-62c6-4487-bdaa-1d009642f7ad"), SINCE);
+        List<ServiceRequest> found = RadiologyOrderSearch.find(
+                server.client, new RadiologyConcepts("e3dea2c8-62c6-4487-bdaa-1d009642f7ad"), SINCE);
 
         assertEquals(List.of("a", "b", "c", "d"), ids(found));
     }
@@ -94,14 +96,15 @@ class RadiologyOrderSearchTest {
             throw new FhirClientConnectionException("timed out", new SocketTimeoutException("Read timed out"));
         };
 
-        assertThrows(FhirClientConnectionException.class,
+        assertThrows(
+                FhirClientConnectionException.class,
                 () -> RadiologyOrderSearch.find(server.client, new RadiologyConcepts(), SINCE));
     }
 
     @Test
     void describeNamesTheRootCauseOnOneLine() {
-        Exception failure = new FhirClientConnectionException("HAPI-1361: Failed to parse response",
-                new SocketTimeoutException("Read timed out"));
+        Exception failure = new FhirClientConnectionException(
+                "HAPI-1361: Failed to parse response", new SocketTimeoutException("Read timed out"));
 
         assertEquals("SocketTimeoutException: Read timed out", RadiologyOrderSearch.describe(failure));
     }
