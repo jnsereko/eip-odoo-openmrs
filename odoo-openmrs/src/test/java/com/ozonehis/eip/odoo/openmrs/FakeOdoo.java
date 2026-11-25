@@ -74,8 +74,15 @@ public class FakeOdoo {
     }
 
     /** A customer invoice (or credit note) and the sale order lines it carries. */
-    public void move(int id, String name, String moveType, String state, String paymentState, double residual,
-            Integer reversedEntryId, int... saleLineIds) {
+    public void move(
+            int id,
+            String name,
+            String moveType,
+            String state,
+            String paymentState,
+            double residual,
+            Integer reversedEntryId,
+            int... saleLineIds) {
         Map<String, Object> move = new HashMap<>();
         move.put("id", id);
         move.put("name", name);

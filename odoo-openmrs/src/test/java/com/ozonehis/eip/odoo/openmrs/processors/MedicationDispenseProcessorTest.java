@@ -8,6 +8,7 @@
 package com.ozonehis.eip.odoo.openmrs.processors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -196,6 +197,43 @@ class MedicationDispenseProcessorTest {
 
         verify(saleOrderHandler, never()).postNoteOnDraftSaleOrder(anyString(), anyString());
         verify(medicationDispenseHandler, never()).getVisitOfOrder(anyString());
+    }
+
+    @Test
+    void shouldWriteTheDefaultNoteInCorrectFrench() {
+        String note = MedicationDispenseProcessor.DEFAULT_DROPPED_NOTE;
+        assertTrue(note.contains("m\u00e9dicament"));
+        assertTrue(note.contains("\u00eatre"));
+        assertTrue(note.contains("factur\u00e9"));
+        assertTrue(note.contains("\u00e0 la main"));
+        assertFalse(note.contains("\u00c3"));
+    }
+
+    @Test
+    void shouldCarryTheSameDefaultNoteInApplicationProperties() throws Exception {
+        // java.util.Properties reads ISO-8859-1 like Spring does: the escapes must give the same text
+        java.util.Properties properties = new java.util.Properties();
+        try (java.io.InputStream in = getClass().getResourceAsStream("/config/application.properties")) {
+            properties.load(in);
+        }
+        String raw = properties.getProperty("odoo.billing.dropped.note");
+        assertEquals(
+                "${ODOO_BILLING_DROPPED_NOTE:" + MedicationDispenseProcessor.DEFAULT_DROPPED_NOTE + "}", raw);
+    }
+
+    @Test
+    void shouldReportTheRootCauseOnOneLine() {
+        Exception root = new IllegalStateException("Multiple Partners exists\nwith reference id 42");
+        Exception wrapped = new CamelExecutionException(
+                "Error processing MedicationRequest on the exchange: Exchange[ABC]", exchange, new RuntimeException(root));
+        assertEquals("Multiple Partners exists with reference id 42", MedicationDispenseProcessor.rootCauseReason(wrapped));
+    }
+
+    @Test
+    void shouldTruncateALongReasonAndNameTheClassWhenThereIsNoMessage() {
+        String reason = MedicationDispenseProcessor.rootCauseReason(new RuntimeException("x".repeat(1000)));
+        assertEquals(MedicationDispenseProcessor.MAX_REASON_LENGTH + 3, reason.length());
+        assertEquals("NullPointerException", MedicationDispenseProcessor.rootCauseReason(new NullPointerException()));
     }
 
     @Test

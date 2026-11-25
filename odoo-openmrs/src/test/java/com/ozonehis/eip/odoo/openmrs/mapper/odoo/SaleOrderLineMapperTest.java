@@ -166,7 +166,8 @@ class SaleOrderLineMapperTest {
 
     @Test
     public void shouldUseTheConfiguredOrdererLabel() {
-        org.springframework.test.util.ReflectionTestUtils.setField(saleOrderLineMapper, "ordererLabel", "Prescripteur :");
+        org.springframework.test.util.ReflectionTestUtils.setField(
+                saleOrderLineMapper, "ordererLabel", "Prescripteur :");
 
         assertEquals(" | Prescripteur : John Doe", saleOrderLineMapper.ordererText("John Doe"));
 

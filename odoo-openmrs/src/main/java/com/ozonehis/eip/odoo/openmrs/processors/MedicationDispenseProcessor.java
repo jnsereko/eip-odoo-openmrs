@@ -20,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import java.util.Set;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
@@ -71,8 +72,8 @@ public class MedicationDispenseProcessor implements Processor {
     @Value("${odoo.billing.dropped.note:" + DEFAULT_DROPPED_NOTE + "}")
     private String droppedNote;
 
-    static final String DEFAULT_DROPPED_NOTE = "Le médicament %s n'a pas pu être facturé automatiquement (prescription"
-            + " %s). Ajoutez-le à la main sur ce devis.";
+    static final String DEFAULT_DROPPED_NOTE = "Le m\u00e9dicament %s n'a pas pu \u00eatre factur\u00e9"
+            + " automatiquement (prescription %s). Ajoutez-le \u00e0 la main sur ce devis.";
 
     @Autowired
     private MedicationDispenseHandler medicationDispenseHandler;
@@ -175,7 +176,7 @@ public class MedicationDispenseProcessor implements Processor {
         }
     }
 
-    /** @return null when billed, else the first line of why not */
+    /** @return null when billed, else why not (see {@link #rootCauseReason}) */
     private String bill(ProducerTemplate producerTemplate, String orderUuid) {
         MedicationRequest medicationRequest = new MedicationRequest();
         medicationRequest.setId(orderUuid);
@@ -187,8 +188,26 @@ public class MedicationDispenseProcessor implements Processor {
             return null;
         } catch (Exception e) {
             log.warn("MedicationRequest {}: could not bill its dispense: {}", orderUuid, e.getMessage());
-            String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-            return message.lines().findFirst().orElse(e.getClass().getSimpleName());
+            return rootCauseReason(e);
         }
+    }
+
+    static final int MAX_REASON_LENGTH = 300;
+
+    /** The message of the deepest cause that has one, on one line and cut to {@value #MAX_REASON_LENGTH} characters. */
+    static String rootCauseReason(Throwable error) {
+        String message = null;
+        Throwable current = error;
+        for (int depth = 0; current != null && depth < 25; depth++) {
+            if (current.getMessage() != null && !current.getMessage().isBlank()) {
+                message = current.getMessage();
+            }
+            current = current.getCause() == current ? null : current.getCause();
+        }
+        if (message == null) {
+            return error.getClass().getSimpleName();
+        }
+        String oneLine = message.lines().map(String::strip).filter(l -> !l.isEmpty()).collect(Collectors.joining(" "));
+        return oneLine.length() > MAX_REASON_LENGTH ? oneLine.substring(0, MAX_REASON_LENGTH) + "..." : oneLine;
     }
 }
