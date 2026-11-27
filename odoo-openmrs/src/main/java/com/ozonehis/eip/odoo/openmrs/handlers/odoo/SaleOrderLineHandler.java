@@ -96,10 +96,26 @@ public class SaleOrderLineHandler {
                         uomExternalId);
                 saleOrderLine.setSaleOrderLineProductUomQty(1f);
             }
-            Uom uom = uomHandler.getUom(uomExternalId);
-            log.debug("SaleOrderLineHandler: Fetched Uom {}", uom);
-            // Store Uom res_id in productUom to display unit in Odoo
-            saleOrderLine.setSaleOrderLineProductUom(uom.getUomResId());
+            if (uomExternalId == null || uomExternalId.isBlank()) {
+                // No unit on the order (UVL-EMR#973: a prescription without a quantity, allowed in the Inpatient
+                // care setting). Looking up a null unit failed every retry, so the order was never billed. The line
+                // is sent without a unit, so Odoo takes the product's own: the quantity, 1 when there is none, is
+                // counted in the product's unit.
+                if (saleOrderLine.getSaleOrderLineProductUomQty() == null) {
+                    saleOrderLine.setSaleOrderLineProductUomQty(1f);
+                }
+                saleOrderLine.setSaleOrderLineProductUom(null);
+                log.info(
+                        "{} {}: no unit on the order, billed {} in the product's unit",
+                        resource.fhirType(),
+                        resource.getIdPart(),
+                        saleOrderLine.getSaleOrderLineProductUomQty());
+            } else {
+                Uom uom = uomHandler.getUom(uomExternalId);
+                log.debug("SaleOrderLineHandler: Fetched Uom {}", uom);
+                // Store Uom res_id in productUom to display unit in Odoo
+                saleOrderLine.setSaleOrderLineProductUom(uom.getUomResId());
+            }
         } else if (resource instanceof ServiceRequest) {
             // Hardcoded to 1 so that `Units` is shown for ServiceRequest
             saleOrderLine.setSaleOrderLineProductUom(1);

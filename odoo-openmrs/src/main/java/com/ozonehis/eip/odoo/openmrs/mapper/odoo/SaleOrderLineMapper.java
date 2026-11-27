@@ -89,12 +89,12 @@ public class SaleOrderLineMapper<R extends Resource> implements ToOdooMapping<R,
         Dosage dosage = medicationRequest.getDosageInstructionFirstRep();
         StringBuilder dosageInstructions = new StringBuilder();
 
-        String dispenseQty = String.valueOf(
-                medicationRequest.getDispenseRequest().getQuantity().getValue());
-        String dispenseQtyUnit = String.valueOf(
-                medicationRequest.getDispenseRequest().getQuantity().getUnit());
+        Quantity dispenseQuantity = medicationRequest.getDispenseRequest().getQuantity();
+        String dispenseQty = String.valueOf(dispenseQuantity.getValue());
+        String dispenseQtyUnit = String.valueOf(dispenseQuantity.getUnit());
 
-        if (dispenseQty != null && dispenseQtyUnit != null) {
+        // A prescription without a quantity (UVL-EMR#973) has no quantity to show, rather than "null null"
+        if (dispenseQuantity.getValue() != null) {
             dosageInstructions
                     .append(dispenseQty)
                     .append(" ")

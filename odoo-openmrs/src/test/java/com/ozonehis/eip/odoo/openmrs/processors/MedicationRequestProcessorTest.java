@@ -481,6 +481,82 @@ class MedicationRequestProcessorTest extends BaseProcessorTest {
         assertThrows(CamelExecutionException.class, () -> medicationRequestProcessor.process(exchange));
     }
 
+    // UVL-EMR #973: billed at prescription, a dispense changes no sale order, so it can neither add a second line nor
+    // touch a paid one
+    @Test
+    void shouldNotChangeTheBillOnADispenseWhenMedicinesAreBilledAtPrescription() {
+        // Arrange
+        Patient patient = new Patient();
+        patient.setId(PATIENT_ID);
+        MedicationRequest medicationRequest = medicationRequestWithFulfillerStatus("COMPLETED");
+        Exchange exchange = createExchange(medicationRequestBundle(patient, medicationRequest), "u");
+        exchange.getMessage().setHeader(Constants.HEADER_MEDICATION_DISPENSE_SYNC, true);
+        mockPartner(patient);
+        when(saleOrderHandler.isMedicationBilledAtPrescription()).thenReturn(true);
+
+        // Act
+        medicationRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, never())
+                .syncDispensedMedicationRequest(any(), any(), any(), any(), any(), any(), any());
+        verify(saleOrderHandler, never())
+                .updateSaleOrderIfExistsWithSaleOrderLine(any(), any(), any(), any(Integer.class), any(), any(), any());
+        verify(saleOrderHandler, never())
+                .createSaleOrderWithSaleOrderLine(any(), any(), any(), any(), any(), any(), any());
+        verify(saleOrderHandler, never()).removeSaleOrderLineFromQuotation(any(), any(), any(), any());
+        verify(saleOrderHandler, never()).updateMedicationRequestLineQuantity(any(), any(), any(), any());
+    }
+
+    // UVL-EMR #973: billed at prescription, a new prescription goes on the visit's quotation before any dispense
+    @Test
+    void shouldCreateTheQuotationWhenAMedicineIsPrescribedAndBilledAtPrescription() {
+        // Arrange
+        Patient patient = new Patient();
+        patient.setId(PATIENT_ID);
+        MedicationRequest medicationRequest = medicationRequestWithFulfillerStatus(null);
+        Exchange exchange = createExchange(medicationRequestBundle(patient, medicationRequest), "c");
+        mockPartner(patient);
+        when(saleOrderHandler.isMedicationBilledAtPrescription()).thenReturn(true);
+        when(saleOrderHandler.getDraftSaleOrderIfExistsByVisitId(eq(ENCOUNTER_VISIT_ID), any()))
+                .thenReturn(null);
+
+        // Act
+        medicationRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, times(1))
+                .createSaleOrderWithSaleOrderLine(
+                        eq(medicationRequest), any(), any(), eq(ENCOUNTER_VISIT_ID), eq(PATIENT_ID), any(), any());
+        verify(medicationDispenseHandler, never()).hasDispensedQuantity(any());
+    }
+
+    // UVL-EMR #973: billed at prescription, a prescription the pharmacy closes with nothing dispensed still leaves
+    // the draft quotation, as before #605
+    @Test
+    void shouldRemoveTheLineOfADeclinedPrescriptionWhenMedicinesAreBilledAtPrescription() {
+        // Arrange
+        Patient patient = new Patient();
+        patient.setId(PATIENT_ID);
+        MedicationRequest medicationRequest = medicationRequestWithFulfillerStatus("DECLINED");
+        Exchange exchange = createExchange(medicationRequestBundle(patient, medicationRequest), "u");
+        mockPartner(patient);
+        when(saleOrderHandler.isMedicationBilledAtPrescription()).thenReturn(true);
+        when(medicationDispenseHandler.hasDispensedQuantity(MEDICATION_REQUEST_ID))
+                .thenReturn(false);
+        when(saleOrderHandler.updateMedicationRequestLineQuantity(any(), any(), any(), any()))
+                .thenReturn(false);
+
+        // Act
+        medicationRequestProcessor.process(exchange);
+
+        // Assert
+        verify(saleOrderHandler, times(1))
+                .removeSaleOrderLineFromQuotation(eq(medicationRequest), eq(ENCOUNTER_VISIT_ID), any(), any());
+        verify(saleOrderHandler, never())
+                .createSaleOrderWithSaleOrderLine(any(), any(), any(), any(), any(), any(), any());
+    }
+
     private void mockPartner(Patient patient) {
         Partner partner = new Partner();
         partner.setPartnerId(PARTNER_ID);

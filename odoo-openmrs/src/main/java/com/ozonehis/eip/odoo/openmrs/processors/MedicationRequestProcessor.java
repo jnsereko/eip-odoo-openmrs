@@ -112,7 +112,15 @@ public class MedicationRequestProcessor implements Processor {
                         .getHeader(
                                 com.ozonehis.eip.odoo.openmrs.Constants.HEADER_MEDICATION_DISPENSE_SYNC,
                                 Boolean.class));
-                if (dispenseSync) {
+                if (dispenseSync && saleOrderHandler.isMedicationBilledAtPrescription()) {
+                    // Billed at prescription (UVL-EMR#973), a dispense does not change the bill: the line keeps what
+                    // was prescribed and a confirmed sale order is never touched. The dispense schedule is not started
+                    // in this mode (MedicationDispenseRouting); this only guards a message sent before a switch.
+                    log.debug(
+                            "MedicationRequest {}: medicines are billed at prescription, so its dispense changes no"
+                                    + " sale order",
+                            medicationRequest.getIdPart());
+                } else if (dispenseSync) {
                     // A dispense of the prescription was recorded, edited or deleted (UVL-EMR#605): its drug line
                     // follows what is dispensed, whatever the prescription's state
                     if (!saleOrderHandler.syncDispensedMedicationRequest(
@@ -132,7 +140,8 @@ public class MedicationRequestProcessor implements Processor {
                             && NOT_DISPENSED_FULFILLER_STATUSES.contains(fulfillerStatus)
                             && !medicationDispenseHandler.hasDispensedQuantity(medicationRequest.getIdPart())) {
                         // Paused or closed by the pharmacy with nothing dispensed: not billed. If the
-                        // pharmacist dispenses later, the dispense schedule adds the line again.
+                        // pharmacist dispenses later, the line is added again: by the dispense schedule when billed
+                        // at dispense, by the prescription's next update when billed at prescription (UVL-EMR#973).
                         // A partly dispensed prescription keeps its line, and so does the line of a drug that other
                         // prescriptions of the visit still bill (UVL-EMR#544), with their quantity.
                         if (saleOrderHandler.updateMedicationRequestLineQuantity(
