@@ -10,6 +10,7 @@ package com.ozonehis.eip.odoo.openmrs.handlers.odoo;
 import static java.util.Arrays.asList;
 
 import com.ozonehis.eip.odoo.openmrs.Constants;
+import com.ozonehis.eip.odoo.openmrs.MedicationBillAt;
 import com.ozonehis.eip.odoo.openmrs.client.OdooClient;
 import com.ozonehis.eip.odoo.openmrs.client.OdooUtils;
 import com.ozonehis.eip.odoo.openmrs.handlers.openmrs.MedicationDispenseHandler;
@@ -55,6 +56,10 @@ public class SaleOrderHandler {
     @Value("${odoo.customer.id.field}")
     private String odooCustomerIdField;
 
+    // prescription or dispense (UVL-EMR#973); see getBilledQuantity
+    @Value("${eip.medication.bill.at:dispense}")
+    private String medicationBillAt;
+
     @Autowired
     private OdooClient odooClient;
 
@@ -86,6 +91,17 @@ public class SaleOrderHandler {
 
     // Odoo sale order states that are still a quotation, so their lines may be changed
     private static final List<String> QUOTATION_STATES = List.of("draft", "sent");
+
+    // Fulfiller statuses the dispensing app sets when the pharmacist pauses or closes a prescription
+    private static final List<String> NOT_DISPENSED_FULFILLER_STATUSES = List.of("ON_HOLD", "DECLINED");
+
+    /**
+     * Whether a medicine is billed when it is prescribed rather than once dispensed ({@code eip.medication.bill.at},
+     * UVL-EMR#973).
+     */
+    public boolean isMedicationBilledAtPrescription() {
+        return MedicationBillAt.fromProperty(medicationBillAt) == MedicationBillAt.PRESCRIPTION;
+    }
 
     /**
      * Posts a note on the visit's draft quotation (UVL-EMR#939).
@@ -766,12 +782,17 @@ public class SaleOrderHandler {
      * non-cancelled sale orders already bill for it:
      *
      * <ul>
-     *   <li>a prescription bills what was dispensed against it, active or stopped (UVL-EMR#605): 20 dispensed of 30
-     *       prescribed bills 20, and a later dispense of the other 10 raises it to 30. Nothing dispensed yet, or
-     *       paused or closed by the pharmacy with nothing dispensed (UVL-EMR#393), bills nothing
+     *   <li>billed at dispense ({@code eip.medication.bill.at=dispense}, the default): a prescription bills what was
+     *       dispensed against it, active or stopped (UVL-EMR#605): 20 dispensed of 30 prescribed bills 20, and a later
+     *       dispense of the other 10 raises it to 30. Nothing dispensed yet, or paused or closed by the pharmacy with
+     *       nothing dispensed (UVL-EMR#393), bills nothing
+     *   <li>billed at prescription ({@code eip.medication.bill.at=prescription}, UVL-EMR#973): an active prescription
+     *       bills its quantity to dispense, dispensed or not, so that it is paid before it is dispensed; paused or
+     *       closed by the pharmacy with nothing dispensed, it bills nothing. A stopped prescription (discontinued or
+     *       revised) bills what was dispensed against it, nothing if nothing was, as before UVL-EMR#605
      *   <li>dispensed in another unit than prescribed, it bills its quantity to dispense
-     *   <li>a prescription in a per-container unit (odoo.per.container.uoms) bills one container once anything
-     *       is dispensed (UVL-EMR#385)
+     *   <li>a prescription in a per-container unit (odoo.per.container.uoms) bills one container (UVL-EMR#385): once
+     *       anything is dispensed, or, billed at prescription, while it is active
      * </ul>
      *
      * @param quotationId the quotation being changed, which is not subtracted; null when it is yet to be created
@@ -816,14 +837,27 @@ public class SaleOrderHandler {
     }
 
     private float getBilledQuantity(DrugOrderInVisit drugOrder) {
-        // The bill follows what the pharmacy gave, not what was prescribed (UVL-EMR#605, decided 13 Nov 2026)
-        if (!medicationDispenseHandler.hasDispensedQuantity(drugOrder.uuid())) {
-            return 0;
-        }
         boolean perContainer = saleOrderLineHandler.isPerContainerUom(drugOrder.quantityUnits());
         // A prescription without a quantity was billed as one unit (Odoo's default line quantity)
         float prescribed = perContainer || drugOrder.quantity() == null ? 1f : drugOrder.quantity();
-        if (perContainer) {
+        boolean atPrescription = isMedicationBilledAtPrescription();
+        if (atPrescription) {
+            // The patient pays at the cashier before the pharmacy dispenses (UVL-EMR#973, decided 27 Nov 2026): the
+            // bill is what was prescribed, and a shortfall at the pharmacy is corrected by hand in Odoo
+            boolean pausedOrClosed = drugOrder.fulfillerStatus() != null
+                    && NOT_DISPENSED_FULFILLER_STATUSES.contains(drugOrder.fulfillerStatus());
+            if (drugOrder.active() && !pausedOrClosed) {
+                return prescribed;
+            }
+        }
+        // Billed at dispense, the bill follows what the pharmacy gave, not what was prescribed (UVL-EMR#605,
+        // decided 13 Nov 2026). Billed at prescription, so does a stopped, paused or closed prescription.
+        if (!medicationDispenseHandler.hasDispensedQuantity(drugOrder.uuid())) {
+            return 0;
+        }
+        if (perContainer || (atPrescription && drugOrder.active())) {
+            // One container (UVL-EMR#385). Billed at prescription, a prescription paused or closed after part of it
+            // was dispensed keeps what was prescribed (UVL-EMR#386).
             return prescribed;
         }
         float dispensed = medicationDispenseHandler.getDispensedQuantity(drugOrder.uuid(), drugOrder.quantityUnits());
