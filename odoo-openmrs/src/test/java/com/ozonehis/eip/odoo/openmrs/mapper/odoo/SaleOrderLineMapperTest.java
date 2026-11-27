@@ -8,7 +8,9 @@
 package com.ozonehis.eip.odoo.openmrs.mapper.odoo;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.ozonehis.eip.odoo.openmrs.model.SaleOrderLine;
@@ -148,6 +150,22 @@ class SaleOrderLineMapperTest {
         assertEquals(
                 "medication | 10 Tablet | 7 Tablet - thrice daily - 10 day | Orderer: requester",
                 saleOrderLine.getSaleOrderLineName());
+    }
+
+    // UVL-EMR #973: a prescription without a quantity maps with no quantity or unit, and its text shows no
+    // "null null"
+    @Test
+    public void shouldMapAMedicationRequestWithoutAQuantity() {
+        MedicationRequest medicationRequest = new MedicationRequest();
+        medicationRequest.setId(MEDICATION_REQUEST_ID);
+        medicationRequest.setMedication(new Reference("Medication/" + MEDICATION_ID).setDisplay("medication"));
+        medicationRequest.setRequester(new Reference().setDisplay("requester"));
+
+        SaleOrderLine saleOrderLine = saleOrderLineMapper.toOdoo(medicationRequest);
+
+        assertNull(saleOrderLine.getSaleOrderLineProductUomQty());
+        assertNull(saleOrderLine.getSaleOrderLineProductUom());
+        assertFalse(saleOrderLine.getSaleOrderLineName().contains("null"), saleOrderLine.getSaleOrderLineName());
     }
 
     @Test

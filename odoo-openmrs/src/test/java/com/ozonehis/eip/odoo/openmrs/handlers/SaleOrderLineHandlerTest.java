@@ -12,6 +12,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.MockitoAnnotations.openMocks;
 
@@ -268,6 +271,50 @@ class SaleOrderLineHandlerTest {
         SaleOrderLine result = buildMedicationLine(10.0f, MILLILITER);
 
         assertEquals(10.0f, result.getSaleOrderLineProductUomQty());
+    }
+
+    // UVL-EMR #973: a prescription without a quantity (Inpatient care setting) has no unit. Looking up a null unit
+    // threw on every retry and the order was never billed: it bills 1 in the product's own unit
+    @Test
+    public void shouldBillOneInTheProductsUnitWhenThePrescriptionHasNoQuantity() {
+        SaleOrderLine result = buildMedicationLineWithoutUnit(null);
+
+        assertEquals(1.0f, result.getSaleOrderLineProductUomQty());
+        assertNull(result.getSaleOrderLineProductUom());
+        verify(uomHandler, never()).getUom(any());
+    }
+
+    // A quantity without a unit is counted in the product's own unit
+    @Test
+    public void shouldBillTheQuantityInTheProductsUnitWhenThePrescriptionHasNoUnit() {
+        SaleOrderLine result = buildMedicationLineWithoutUnit(10.0f);
+
+        assertEquals(10.0f, result.getSaleOrderLineProductUomQty());
+        assertNull(result.getSaleOrderLineProductUom());
+        verify(uomHandler, never()).getUom(any());
+    }
+
+    private SaleOrderLine buildMedicationLineWithoutUnit(Float quantity) {
+        Resource resource = new MedicationRequest();
+        SaleOrder saleOrder = new SaleOrder();
+        saleOrder.setOrderId(ORDER_ID);
+        Product product = new Product();
+        product.setProductResId(PRODUCT_ID);
+        SaleOrderLine saleOrderLine = new SaleOrderLine();
+        saleOrderLine.setSaleOrderLineName("Cetirizine | 10 mg");
+        saleOrderLine.setSaleOrderLineProductUomQty(quantity);
+        when(productHandler.getProduct(resource)).thenReturn(product);
+        when(odooClient.searchAndRead(
+                        Constants.SALE_ORDER_LINE_MODEL,
+                        asList(asList("order_id", "=", ORDER_ID), asList("product_id", "=", PRODUCT_ID)),
+                        null))
+                .thenReturn(new Object[] {});
+        when(saleOrderLineMapper.toOdoo(resource)).thenReturn(saleOrderLine);
+        when(uomHandler.getUom(null)).thenThrow(new RuntimeException("No Uom found with id null"));
+
+        SaleOrderLine result = saleOrderLineHandler.buildSaleOrderLineIfProductExists(resource, saleOrder);
+        assertNotNull(result);
+        return result;
     }
 
     private SaleOrderLine buildMedicationLine(float quantity, String unit) {

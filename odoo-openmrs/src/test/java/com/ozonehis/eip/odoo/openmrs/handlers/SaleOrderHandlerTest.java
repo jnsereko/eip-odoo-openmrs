@@ -1475,6 +1475,64 @@ class SaleOrderHandlerTest {
         verify(medicationDispenseHandler, never()).hasDispensedQuantity("rx-1");
     }
 
+    // UVL-EMR #973, billed at prescription: a quantity without a unit bills that quantity (in the product's unit)
+    @Test
+    public void shouldBillAQuantityWithoutAUnitAtPrescription() throws Exception {
+        saleOrderHandler.setMedicationBillAt("prescription");
+        SaleOrderLine newLine = addMedicationLine(new DrugOrderInVisit("rx-1", true, 10f, null, null), 0f);
+
+        assertEquals(10f, newLine.getSaleOrderLineProductUomQty());
+        verify(medicationDispenseHandler, never()).hasDispensedQuantity(any());
+    }
+
+    // Billed at prescription: no quantity and no unit bills 1
+    @Test
+    public void shouldBillOneForAPrescriptionWithoutAQuantityAtPrescription() throws Exception {
+        saleOrderHandler.setMedicationBillAt("prescription");
+        SaleOrderLine newLine = addMedicationLine(new DrugOrderInVisit("rx-1", true, null, null, null), 0f);
+
+        assertEquals(1f, newLine.getSaleOrderLineProductUomQty());
+    }
+
+    // Billed at dispense: a prescription without a quantity, once dispensed without a unit either, bills 1
+    @Test
+    public void shouldBillOneForADispensedPrescriptionWithoutAQuantityAtDispense() throws Exception {
+        SaleOrderLine newLine = addMedicationLine(new DrugOrderInVisit("rx-1", true, null, null, null), 0f);
+
+        assertEquals(1f, newLine.getSaleOrderLineProductUomQty());
+    }
+
+    // Billed at dispense: a quantity without a unit bills what was dispensed, in the product's unit
+    @Test
+    public void shouldBillWhatWasDispensedOfAPrescriptionWithoutAUnitAtDispense() throws Exception {
+        SaleOrderLine newLine = addMedicationLine(new DrugOrderInVisit("rx-1", true, 10f, null, null), 6f);
+
+        assertEquals(6f, newLine.getSaleOrderLineProductUomQty());
+    }
+
+    // Adds the drug of a dispensed prescription without a unit to a draft quotation that has no line for it yet
+    private SaleOrderLine addMedicationLine(DrugOrderInVisit drugOrder, float dispensed) throws Exception {
+        MedicationRequest prescription = medicationRequest(drugOrder.uuid());
+        mockDrugProduct(prescription);
+        SaleOrder quotation = quotation(1);
+        when(saleOrderLineHandler.getSaleOrderLineIfExists(1, 123)).thenReturn(null);
+        mockVisitLinesOfTest();
+        when(orderHandler.getDrugOrdersInVisit(drugOrder.uuid())).thenReturn(List.of(drugOrder));
+        when(medicationDispenseHandler.hasDispensedQuantity(drugOrder.uuid())).thenReturn(true);
+        when(medicationDispenseHandler.getDispensedQuantity(drugOrder.uuid(), null))
+                .thenReturn(dispensed);
+        SaleOrderLine newLine = new SaleOrderLine();
+        when(saleOrderLineHandler.buildSaleOrderLineIfProductExists(prescription, quotation))
+                .thenReturn(newLine);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+
+        saleOrderHandler.updateSaleOrderIfExistsWithSaleOrderLine(
+                prescription, quotation, VISIT_ID_1, PARTNER_ID, PATIENT_ID, null, producerTemplate);
+
+        verify(producerTemplate, times(1)).sendBody("direct:odoo-create-sale-order-line-route", newLine);
+        return newLine;
+    }
+
     // The setting: dispense by default (the fork's behaviour since #605), prescription when set, any other value
     // refused
     @Test
